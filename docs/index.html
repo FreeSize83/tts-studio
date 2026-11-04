@@ -6,196 +6,510 @@
 <title>TTS Studio — озвучка на ElevenLabs для видео и игр</title>
 <meta name="description" content="Настольная студия озвучки для Windows: голоса ElevenLabs через OpenRouter, дубли, персонажи, нормализация громкости и перетаскивание в DaVinci Resolve.">
 <meta property="og:title" content="TTS Studio">
-<meta property="og:description" content="Настольная студия озвучки для Windows: дубли, персонажи, нормализация и Drag to DaVinci.">
+<meta property="og:description" content="Текст на входе, готовая реплика на таймлайне. Студия озвучки для Windows.">
 <meta property="og:image" content="https://freesize83.github.io/tts-studio/assets/main.png">
 <link rel="icon" href="assets/icon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Manrope:wght@400;500;700;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Manrope:wght@500;700;800&family=Unbounded:wght@500;700;900&display=swap" rel="stylesheet">
 <style>
 :root {
-  --bg: #141415; --panel: #1d1d1f; --raised: #262629; --line: #333337;
-  --text: #ecebe8; --dim: #a3a2a6; --accent: #e8833a; --accent2: #c4452f; --soft: #ffb27a;
+  --bg: #0c0a0e; --glass: rgba(26, 23, 30, .72); --line: rgba(255, 255, 255, .11);
+  --text: #f6f2ec; --dim: #b9b3b4; --accent: #ff9248; --hot: #ff4d3d; --pink: #ff3d8b; --violet: #9a6bff; --soft: #ffc08f;
+  --glow: 255, 146, 72;
   --mono: "JetBrains Mono", Consolas, monospace;
   --sans: "Manrope", "Segoe UI", system-ui, sans-serif;
+  --display: "Unbounded", "Segoe UI", sans-serif;
+  --grad: linear-gradient(100deg, #ffb35c, #ff6a3d 35%, #ff3d8b 70%, #9a6bff);
 }
 * { box-sizing: border-box; }
-html { scroll-behavior: smooth; }
-body { margin: 0; background: var(--bg); color: var(--text); font: 500 17px/1.6 var(--sans); overflow-x: hidden; }
+/* Всё на сайте задано в rem, поэтому от этой строки масштабируется вся страница: 16px на телефоне, 24px на 2K, 34px на 4K */
+html { font-size: clamp(16px, calc(9.6px + .5625vw), 34px); scroll-behavior: smooth; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 500 1rem/1.6 var(--sans); overflow-x: clip; }
 img { display: block; max-width: 100%; height: auto; }
 a { color: inherit; }
-.wrap { width: min(1160px, 100% - 40px); margin-inline: auto; }
+code { font: 400 .9em var(--mono); color: var(--soft); }
+.wrap { width: min(76rem, 100% - 2.5rem); margin-inline: auto; position: relative; }
 
-nav { display: flex; align-items: center; justify-content: space-between; padding: 20px 0; gap: 16px; }
-.brand { display: flex; align-items: center; gap: 10px; font-weight: 800; text-decoration: none; }
-.brand img { width: 32px; height: 32px; }
-nav ul { display: flex; gap: 26px; list-style: none; margin: 0; padding: 0; font-size: 15px; color: var(--dim); }
-nav ul a { text-decoration: none; }
-nav ul a:hover { color: var(--text); }
+#aurora, #ribbons { position: fixed; inset: 0; width: 100%; height: 100%; z-index: -2; display: block; }
+#aurora { background: radial-gradient(60% 50% at 25% 15%, #4a1c2c, transparent), radial-gradient(60% 60% at 85% 70%, #2a1a52, transparent), var(--bg); }
+#ribbons { z-index: -1; }
 
-.hero { padding: 64px 0 0; }
-.kicker { font: 400 13px var(--mono); color: var(--soft); letter-spacing: .04em; margin: 0 0 18px; }
-h1 { font-size: clamp(40px, 7vw, 84px); line-height: 1.04; letter-spacing: -.035em; font-weight: 800; margin: 0; max-width: 13em; }
-h1 em { font-style: normal; color: var(--accent); }
-.lead { font-size: clamp(18px, 2vw, 21px); color: var(--dim); max-width: 36em; margin: 26px 0 34px; }
-.cta { display: flex; flex-wrap: wrap; align-items: center; gap: 14px 22px; }
-.btn { display: inline-flex; align-items: center; gap: 10px; padding: 15px 26px; border-radius: 8px; font-weight: 800; text-decoration: none;
-  background: linear-gradient(90deg, var(--accent2), var(--accent)); color: #111; transition: transform .15s; }
-.btn:hover { transform: translateY(-2px); }
-.btn:focus-visible, a:focus-visible { outline: 2px solid var(--soft); outline-offset: 3px; }
-.meta { font: 400 13px var(--mono); color: var(--dim); }
-.ghost { color: var(--dim); font-size: 15px; }
-.ghost:hover { color: var(--text); }
+nav { position: sticky; top: 0; z-index: 10; background: rgba(12, 10, 14, .62); backdrop-filter: blur(14px); border-bottom: 1px solid var(--line); }
+nav .wrap { display: flex; align-items: center; justify-content: space-between; padding: 1.1rem 0; gap: 1rem; }
+.brand { display: flex; align-items: center; gap: .6rem; font: 700 1rem var(--display); text-decoration: none; }
+.brand img { width: 2rem; height: 2rem; }
+nav ul { display: flex; gap: 1.7rem; list-style: none; margin: 0; padding: 0; font-size: .92rem; font-weight: 700; color: var(--dim); }
+nav ul a { text-decoration: none; transition: color .2s; }
+nav ul a:hover { color: var(--accent); }
 
-.wave { display: flex; align-items: flex-end; gap: 4px; height: 76px; margin: 56px 0 -1px; overflow: hidden; }
-.wave i { flex: 1 0 5px; min-width: 5px; background: linear-gradient(0deg, var(--accent2), var(--accent)); border-radius: 3px 3px 0 0;
-  height: calc(var(--h) * 1%); transform-origin: bottom; animation: pulse 2.6s ease-in-out infinite; animation-delay: calc(var(--d) * -1s); }
-@keyframes pulse { 50% { transform: scaleY(.45); } }
-@media (prefers-reduced-motion: reduce) { .wave i { animation: none; } .btn { transition: none; } html { scroll-behavior: auto; } }
+.grad { background: var(--grad); background-size: 220% 100%; -webkit-background-clip: text; background-clip: text; color: transparent; animation: flow 7s linear infinite alternate; }
+@keyframes flow { to { background-position: 100% 0; } }
 
-.shot { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--panel); }
-.hero .shot { box-shadow: 0 40px 90px -40px rgba(232, 131, 58, .45); }
+.hero { padding-top: 3.5rem; text-align: center; }
+.kicker { display: inline-flex; align-items: center; gap: .6rem; font: 400 .82rem var(--mono); color: var(--soft); border: 1px solid var(--line); border-radius: 99px; padding: .35rem 1rem; background: var(--glass); margin: 0 0 1.6rem; }
+.kicker i { width: .5rem; height: .5rem; border-radius: 50%; background: var(--hot); animation: rec 1.4s infinite; }
+@keyframes rec { 50% { opacity: .25; } }
+h1, h2, h3 { font-family: var(--display); }
+h1 { font-size: clamp(2.3rem, 6.2vw, 5.6rem); line-height: 1.08; letter-spacing: -.03em; font-weight: 900; margin: 0; }
+.rotor { display: inline-grid; vertical-align: bottom; }
+.rotor b { grid-area: 1 / 1; font-weight: 900; opacity: 0; transform: translateY(.55em) rotateX(-70deg); transition: opacity .5s, transform .6s cubic-bezier(.2, .9, .25, 1.2); transform-origin: 50% 100%; padding-bottom: .08em; }
+.rotor b.on { opacity: 1; transform: none; }
+.lead { font-size: clamp(1.1rem, 1.7vw, 1.4rem); line-height: 1.5; color: var(--dim); max-width: 38rem; margin: 1.6rem auto 2.2rem; }
+.lead strong { color: var(--text); font-weight: 800; }
+.cta { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: .9rem 1.4rem; }
+.btn { position: relative; display: inline-flex; align-items: center; gap: .6rem; padding: 1rem 1.9rem; border-radius: .7rem; font: 700 1rem var(--display); text-decoration: none; color: #150a06;
+  background: linear-gradient(100deg, #ffb35c, #ff6a3d); box-shadow: 0 .8rem 2.6rem -.6rem rgba(255, 106, 61, .8); transition: transform .18s, box-shadow .18s; }
+.btn:hover { transform: translateY(-3px) scale(1.03); box-shadow: 0 1.2rem 3.4rem -.6rem rgba(255, 106, 61, 1); }
+.btn:focus-visible, a:focus-visible, button:focus-visible { outline: 2px solid var(--soft); outline-offset: 3px; }
+.meta { font: 400 .82rem var(--mono); color: var(--dim); }
 
-section { padding: 96px 0 0; }
-h2 { font-size: clamp(30px, 4vw, 46px); line-height: 1.12; letter-spacing: -.025em; font-weight: 800; margin: 0 0 16px; max-width: 18em; }
-.sub { color: var(--dim); max-width: 38em; margin: 0; }
+/* Окно программы в герое */
+.stage { perspective: 1800px; margin-top: 3.4rem; position: relative; }
+.tilt { position: relative; transform-style: preserve-3d; transform: rotateX(var(--rx, 0deg)) rotateY(var(--ry, 0deg)) scale(var(--s, 1)); transition: transform .25s ease-out; will-change: transform; }
+.win { position: relative; border: 1px solid var(--line); border-radius: .9rem; overflow: hidden; background: #17151a; box-shadow: 0 2.5rem 7rem -1.5rem rgba(var(--glow), .55), 0 0 0 1px rgba(var(--glow), .18); transition: box-shadow .8s; }
+.bar { display: flex; align-items: center; gap: .4rem; height: 2rem; padding: 0 .9rem; background: rgba(255, 255, 255, .05); font: 400 .72rem var(--mono); color: var(--dim); }
+.bar i { width: .62rem; height: .62rem; border-radius: 50%; background: rgba(255, 255, 255, .22); }
+.bar span { margin-left: .6rem; }
+.frames { position: relative; aspect-ratio: 2160 / 1350; }
+.frames img { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; transition: opacity .8s; }
+.frames img.on { opacity: 1; }
+.float { position: absolute; z-index: 2; padding: .5rem .9rem; border-radius: .6rem; font: 600 .85rem var(--mono); color: var(--text); background: rgba(18, 15, 22, .92); border: 1px solid rgba(var(--glow), .6);
+  box-shadow: 0 .8rem 2rem -.4rem rgba(0, 0, 0, .7); transform: translateZ(60px); animation: bob 5s ease-in-out infinite; white-space: nowrap; transition: border-color .8s; }
+.float b { color: var(--accent); font-weight: 600; }
+.f1 { top: 14%; left: -2.4rem; } .f2 { top: 47%; right: -2.4rem; animation-delay: -1.7s; } .f3 { bottom: 8%; left: 7%; animation-delay: -3.2s; }
+@keyframes bob { 50% { translate: 0 -.7rem; } }
+.chips { display: flex; flex-wrap: wrap; justify-content: center; gap: .5rem; margin-top: 1.5rem; }
+.chips button { font: 700 .82rem var(--sans); color: var(--dim); background: var(--glass); border: 1px solid var(--line); border-radius: 99px; padding: .4rem .95rem; cursor: pointer; transition: all .2s; }
+.chips button:hover { color: var(--text); }
+.chips button.on { color: #150a06; background: var(--accent); border-color: transparent; }
 
-.feats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; margin-top: 44px; }
-.feats div { background: var(--panel); padding: 28px; }
-.feats h3 { margin: 0 0 8px; font-size: 19px; font-weight: 800; }
-.feats p { margin: 0; color: var(--dim); font-size: 15.5px; }
-.feats code, .steps code { font: 400 .9em var(--mono); color: var(--soft); }
+/* Бегущая строка */
+.ticker { margin-top: 5.5rem; overflow: hidden; transform: rotate(-1.4deg) scale(1.03); background: var(--grad); }
+.ticker div { display: flex; width: max-content; animation: run 34s linear infinite; }
+.ticker span { font: 900 clamp(1.3rem, 2.4vw, 2.1rem) var(--display); color: #120808; padding: .6rem 1.4rem; white-space: nowrap; }
+@keyframes run { to { transform: translateX(-50%); } }
 
-.split { display: grid; grid-template-columns: 1fr 1.5fr; gap: 56px; align-items: center; }
+section { padding-top: 7rem; }
+.eyebrow { font: 400 .85rem var(--mono); color: var(--accent); margin: 0 0 .9rem; }
+h2 { font-size: clamp(1.9rem, 3.8vw, 3.5rem); line-height: 1.14; letter-spacing: -.025em; font-weight: 700; margin: 0 0 1.1rem; }
+.sub { color: var(--dim); font-size: 1.1rem; max-width: 40rem; margin: 0; }
 
-.update { display: grid; grid-template-columns: 1.2fr 1fr; gap: 56px; align-items: center; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: clamp(28px, 5vw, 56px); }
-.update ol { list-style: none; margin: 0; padding: 0; font: 400 14px var(--mono); }
-.update li { padding: 13px 0; border-top: 1px solid var(--line); color: var(--dim); display: flex; justify-content: space-between; gap: 14px; }
-.update li:first-child { border-top: 0; }
-.update li b { color: var(--soft); font-weight: 600; white-space: nowrap; }
+/* Живой редактор */
+.demo { display: grid; grid-template-columns: 1fr 1.15fr; gap: 3.4rem; align-items: center; }
+.console { border: 1px solid var(--line); border-radius: .9rem; background: var(--glass); overflow: hidden; backdrop-filter: blur(10px); }
+.typed { min-height: 8.2rem; padding: 1.3rem 1.4rem .6rem; font: 400 1.12rem/1.55 var(--mono); }
+.typed em { font-style: normal; color: var(--accent); }
+.caret { display: inline-block; width: .55em; height: 1.1em; vertical-align: -.15em; margin-left: .1em; background: var(--accent); animation: rec 1s steps(2) infinite; }
+.eq { display: flex; align-items: flex-end; gap: 3px; height: 4.6rem; padding: 0 1.4rem; }
+.eq i { flex: 1; height: 100%; border-radius: 2px 2px 0 0; background: linear-gradient(0deg, var(--hot), var(--accent)); transform: scaleY(.05); transform-origin: bottom; }
+.params { display: flex; flex-wrap: wrap; gap: .4rem 1.3rem; padding: .9rem 1.4rem; border-top: 1px solid var(--line); margin-top: .8rem; font: 400 .78rem var(--mono); color: var(--dim); }
+.params b { color: var(--soft); font-weight: 600; }
 
-.themes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 40px; }
-.themes figure { margin: 0; }
-.themes figcaption { font: 400 13px var(--mono); color: var(--dim); margin-top: 10px; }
+/* Возможности */
+.feats { display: grid; grid-template-columns: repeat(6, 1fr); gap: 1rem; margin-top: 3rem; }
+.card { position: relative; grid-column: span 2; padding: 1.8rem; border-radius: .9rem; background: var(--glass); border: 1px solid var(--line); overflow: hidden; transition: transform .25s, border-color .25s; }
+.card.wide { grid-column: span 3; }
+.card::before { content: ""; position: absolute; inset: 0; background: radial-gradient(18rem circle at var(--x, 50%) var(--y, 0%), rgba(255, 146, 72, .22), transparent 70%); opacity: 0; transition: opacity .25s; }
+.card:hover { transform: translateY(-5px); border-color: rgba(255, 146, 72, .55); }
+.card:hover::before { opacity: 1; }
+.card > * { position: relative; }
+.card h3 { margin: 0 0 .6rem; font-size: 1.15rem; font-weight: 700; line-height: 1.25; }
+.card p { margin: 0; color: var(--dim); font-size: 1rem; }
+.num { display: block; font: 900 3rem/1 var(--display); margin-bottom: .7rem; }
 
-.steps { counter-reset: s; list-style: none; padding: 0; margin: 40px 0 0; display: grid; grid-template-columns: repeat(3, 1fr); gap: 32px; }
+/* Голоса */
+.split { display: grid; grid-template-columns: 1fr 1.6fr; gap: 3.4rem; align-items: center; }
+.split .stage { margin: 0; }
+.voice-tags { display: flex; flex-wrap: wrap; gap: .45rem; margin-top: 1.5rem; }
+.voice-tags span { font: 400 .82rem var(--mono); padding: .25rem .7rem; border-radius: 99px; border: 1px solid var(--line); color: var(--dim); background: var(--glass); }
+
+/* Веер тем */
+.fan { position: relative; height: 34rem; margin-top: 3rem; perspective: 1800px; }
+.fan button { position: absolute; left: 50%; top: 50%; width: 42rem; max-width: 80%; padding: 0; border: 1px solid var(--line); border-radius: .8rem; overflow: hidden; background: #17151a; cursor: zoom-in; box-shadow: 0 2rem 4rem -1rem rgba(0, 0, 0, .9);
+  transform: translate(-50%, -50%) translateX(calc(var(--i) * 13.5rem)) translateY(calc(var(--a) * 1.1rem)) rotate(calc(var(--i) * 4deg)) rotateY(calc(var(--i) * -7deg)); z-index: calc(10 - var(--a)); transition: transform .4s cubic-bezier(.2, .9, .25, 1.1), filter .3s; filter: brightness(calc(1 - var(--a) * .12)); }
+.fan button:hover, .fan button:focus-visible { transform: translate(-50%, -50%) translateX(calc(var(--i) * 13.5rem)) translateY(-1.5rem) scale(1.1); z-index: 20; filter: none; }
+.fan span { display: block; padding: .5rem .8rem; text-align: left; font: 400 .8rem var(--mono); color: var(--dim); background: #17151a; }
+
+/* Обновление */
+.update { position: relative; display: grid; grid-template-columns: 1.15fr 1fr; gap: 3.4rem; align-items: center; border-radius: 1.1rem; padding: clamp(1.8rem, 4vw, 3.6rem); overflow: hidden; background: var(--glass); border: 1px solid rgba(255, 146, 72, .4); }
+.update::before { content: ""; position: absolute; width: 34rem; height: 34rem; right: -10rem; top: -14rem; background: radial-gradient(closest-side, rgba(255, 61, 139, .32), transparent); }
+.update > * { position: relative; }
+.pipe { list-style: none; margin: 0; padding: 0; }
+.pipe li { display: flex; align-items: center; gap: .9rem; padding: .75rem 0; font-weight: 700; color: var(--dim); transition: color .3s; }
+.pipe i { flex: none; width: 1.7rem; height: 1.7rem; border-radius: 50%; border: 2px solid var(--line); display: grid; place-items: center; font: 600 .8rem var(--mono); font-style: normal; transition: all .3s; }
+.pipe li.on { color: var(--text); }
+.pipe li.on i { background: var(--accent); border-color: var(--accent); color: #150a06; box-shadow: 0 0 1.1rem var(--accent); }
+
+.steps { counter-reset: s; list-style: none; padding: 0; margin: 3rem 0 0; display: grid; grid-template-columns: repeat(3, 1fr); gap: 2.2rem; }
 .steps li { counter-increment: s; }
-.steps li::before { content: counter(s); display: block; font: 800 44px var(--sans); color: var(--accent); line-height: 1; margin-bottom: 12px; }
-.steps h3 { margin: 0 0 6px; font-size: 19px; font-weight: 800; }
-.steps p { margin: 0; color: var(--dim); font-size: 15.5px; }
-.note { margin-top: 36px; padding: 18px 22px; border-left: 3px solid var(--accent); background: var(--panel); color: var(--dim); font-size: 15.5px; }
+.steps li::before { content: counter(s); display: block; font: 900 4rem/1 var(--display); margin-bottom: .8rem; background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.steps h3 { margin: 0 0 .4rem; font-size: 1.15rem; font-weight: 700; }
+.steps p { margin: 0; color: var(--dim); }
+.note { margin: 2.2rem 0 0; padding: 1.1rem 1.4rem; border-left: 3px solid var(--accent); background: var(--glass); color: var(--dim); border-radius: 0 .5rem .5rem 0; }
+.note + .note { margin-top: .8rem; }
 .note b { color: var(--text); }
 
-footer { margin-top: 96px; padding: 28px 0 40px; border-top: 1px solid var(--line); color: var(--dim); font-size: 14px; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; }
+.final { text-align: center; padding-top: 8rem; }
+.final h2 { font-size: clamp(2.1rem, 5vw, 4.6rem); font-weight: 900; }
+footer { margin-top: 6rem; padding: 1.8rem 0 2.5rem; border-top: 1px solid var(--line); color: var(--dim); font-size: .9rem; display: flex; flex-wrap: wrap; justify-content: space-between; gap: .8rem; }
 
-@media (max-width: 860px) {
+dialog { width: min(92vw, 150vh); max-width: none; padding: 0; border: 1px solid var(--line); border-radius: .8rem; background: #17151a; overflow: hidden; }
+dialog::backdrop { background: rgba(5, 3, 8, .86); }
+dialog img { width: 100%; cursor: zoom-out; }
+
+/* Появление при прокрутке — только если работает JS */
+.js .rise { opacity: 0; transform: translateY(2.4rem); transition: opacity .8s, transform .8s cubic-bezier(.2, .8, .2, 1); transition-delay: calc(var(--n, 0) * 70ms); }
+.js .rise.in { opacity: 1; transform: none; }
+.js .card.rise.in:hover { transform: translateY(-5px); transition-delay: 0s; }
+
+@media (max-width: 900px) {
   nav ul { display: none; }
-  .hero { padding-top: 32px; }
-  .feats, .themes, .steps, .split, .update { grid-template-columns: 1fr; }
-  .split, .update { gap: 28px; }
-  section { padding-top: 72px; }
+  .hero { padding-top: 1.5rem; }
+  .demo, .split, .update, .steps { grid-template-columns: 1fr; gap: 2rem; }
+  .feats { grid-template-columns: 1fr; }
+  .card, .card.wide { grid-column: auto; }
   .btn { width: 100%; justify-content: center; }
+  section { padding-top: 5rem; }
+  .float { display: none; }
+  .fan { height: auto; display: flex; gap: 1rem; overflow-x: auto; scroll-snap-type: x mandatory; margin-inline: -1.25rem; padding: 0 1.25rem 1rem; }
+  .fan button, .fan button:hover, .fan button:focus-visible { position: static; flex: 0 0 85%; max-width: none; width: auto; transform: none; filter: none; scroll-snap-align: center; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+  .js .rise { opacity: 1; transform: none; }
 }
 </style>
 </head>
 <body>
-<div class="wrap">
-  <nav>
-    <a class="brand" href="#top"><img src="assets/icon.png" alt="" width="32" height="32">TTS Studio</a>
-    <ul>
-      <li><a href="#features">Возможности</a></li>
-      <li><a href="#voices">Голоса</a></li>
-      <li><a href="#update">Обновления</a></li>
-      <li><a href="#start">Как начать</a></li>
-      <li><a href="https://github.com/FreeSize83/tts-studio">GitHub</a></li>
-    </ul>
-  </nav>
+<canvas id="aurora" aria-hidden="true"></canvas>
+<canvas id="ribbons" aria-hidden="true"></canvas>
+<script>document.documentElement.classList.add("js");</script>
 
-  <header class="hero" id="top">
-    <p class="kicker">Windows · OpenRouter × ElevenLabs v4</p>
-    <h1>Рабочий стол для <em>озвучки</em>, а не окно API</h1>
-    <p class="lead">Пишите реплику, слушайте дубли, подбирайте голос персонажу и перетаскивайте готовый файл прямо на таймлайн DaVinci Resolve.</p>
-    <div class="cta">
-      <a class="btn" href="https://github.com/FreeSize83/tts-studio/releases/latest/download/TTS-Studio.exe">Скачать для Windows</a>
-      <span class="meta" id="rel">Один .exe, установка не нужна</span>
-    </div>
-    <div class="wave" id="wave" aria-hidden="true"></div>
-    <div class="shot"><img src="assets/main.png" width="1440" height="876" alt="Главное окно TTS Studio: настройки голоса слева, плеер и лента дублей справа"></div>
-  </header>
+<nav><div class="wrap">
+  <a class="brand" href="#top"><img src="assets/icon.png" alt="" width="32" height="32">TTS Studio</a>
+  <ul>
+    <li><a href="#live">Как звучит</a></li>
+    <li><a href="#features">Возможности</a></li>
+    <li><a href="#voices">Голоса</a></li>
+    <li><a href="#themes">Темы</a></li>
+    <li><a href="#start">Как начать</a></li>
+    <li><a href="https://github.com/FreeSize83/tts-studio">GitHub</a></li>
+  </ul>
+</div></nav>
 
-  <section id="features">
-    <h2>Всё, что нужно между текстом и таймлайном</h2>
-    <div class="feats">
-      <div><h3>Лента дублей</h3><p>Каждая генерация сохраняется с её настройками: можно переслушать, вернуть текст в редактор и повторить seed. Кэш чистится сам через 7 дней.</p></div>
-      <div><h3>Drag to DaVinci</h3><p>Сохранённый дубль перетаскивается мышью в DaVinci Resolve или другую программу, без поиска файла в папках.</p></div>
-      <div><h3>Громкость по стандарту</h3><p>Нормализация к LUFS при сохранении, с мягким лимитером пиков. Оригинал в кэше не меняется.</p></div>
-      <div><h3>Ударения и теги</h3><p>Ударение ставится одной кнопкой, эмоции — тегами вроде <code>[whispering]</code> и <code>[sighs]</code>. Можно добавить свои.</p></div>
-      <div><h3>Бесшовная склейка</h3><p>Передайте соседние фразы как контекст, и реплики будут лучше звучать вместе. Stability, Similarity, Style и Speed настраиваются ползунками.</p></div>
-      <div><h3>Семь тем</h3><p>От DaVinci Studio до Neon Synthwave. Тема меняется сразу, перезапуск не нужен.</p></div>
-    </div>
-  </section>
+<header class="hero wrap" id="top">
+  <p class="kicker"><i></i>Windows · ElevenLabs v4 через OpenRouter</p>
+  <h1>Дайте голос<br>
+    <span class="rotor" id="rotor"><b class="grad on">своему ролику</b><b class="grad">каждому герою</b><b class="grad">вашей игре</b><b class="grad">любому тексту</b></span>
+  </h1>
+  <p class="lead">Написали реплику. Послушали три дубля. Лучший <strong>перетащили прямо на таймлайн DaVinci</strong>. Всё в одном окне, без вкладок и API-консоли.</p>
+  <div class="cta">
+    <a class="btn" href="https://github.com/FreeSize83/tts-studio/releases/latest/download/TTS-Studio.exe">Скачать для Windows</a>
+    <span class="meta" id="rel">Один .exe, установка не нужна</span>
+  </div>
 
-  <section id="voices" class="split">
-    <div>
-      <h2>Голос для каждого персонажа</h2>
-      <p class="sub">Каталог с фильтрами по полу и поиском по описанию. Английский сэмпл бесплатный, русский генерируется один раз и остаётся в кэше. Собирайте персонажей в профили проектов: выбрали персонажа — вернулись его голос и настройки.</p>
-    </div>
-    <div class="shot"><img src="assets/voices.png" width="1240" height="640" loading="lazy" alt="Каталог голосов с карточками, фильтрами и профилями персонажей"></div>
-  </section>
-
-  <section id="update">
-    <div class="update">
-      <div>
-        <h2>Обновление — одна кнопка</h2>
-        <p class="sub">Нажмите «Обновить» в программе, и она заменит себя новой версией и перезапустится. Браузер и установщик не нужны. Настройки, API-ключ, дубли и текст в редакторе остаются на месте.</p>
+  <div class="stage" id="heroStage">
+    <div class="tilt" data-tilt>
+      <div class="win">
+        <div class="bar"><i></i><i></i><i></i><span id="themeName">TTS Studio — DaVinci Studio</span></div>
+        <div class="frames" id="frames"><img class="on" src="assets/theme-davinci.webp" width="2160" height="1350" alt="Главное окно TTS Studio: настройки голоса слева, плеер и лента дублей справа"></div>
       </div>
-      <ol>
-        <li>Проверка версии <b>GitHub Releases</b></li>
-        <li>Скачивание <b>SHA-256</b></li>
-        <li>Замена файла <b>без установщика</b></li>
-        <li>Перезапуск <b>сразу</b></li>
-      </ol>
+      <div class="float f1"><b>[whispering]</b> Не включай свет.</div>
+      <div class="float f2"><b>−16 LUFS</b> готово к монтажу</div>
+      <div class="float f3">✋ <b>Drag</b> to DaVinci</div>
     </div>
-  </section>
+  </div>
+  <div class="chips" id="chips" role="group" aria-label="Тема оформления на скриншоте"></div>
+</header>
 
-  <section>
-    <h2>Семь тем на любой монтажный стол</h2>
-    <div class="themes">
-      <figure><div class="shot"><img src="assets/midnight.png" width="1440" height="876" loading="lazy" alt="Тема Midnight Pro"></div><figcaption>Midnight Pro</figcaption></figure>
-      <figure><div class="shot"><img src="assets/neon.png" width="1440" height="876" loading="lazy" alt="Тема Neon Synthwave"></div><figcaption>Neon Synthwave</figcaption></figure>
-      <figure><div class="shot"><img src="assets/light.png" width="1440" height="876" loading="lazy" alt="Тема Studio Light"></div><figcaption>Studio Light</figcaption></figure>
+<div class="ticker" aria-hidden="true"><div id="ticker"></div></div>
+
+<section id="live" class="wrap demo">
+  <div class="rise">
+    <p class="eyebrow">// режиссура текстом</p>
+    <h2>Шепот, холод, вздох: <span class="grad">пишите эмоцию прямо в строке</span></h2>
+    <p class="sub">Теги задают подачу, а ударение ставится одной кнопкой, и «за́мок» больше не превратится в «замо́к». Не понравилось? Сдвиньте ползунок и снимите новый дубль: старый останется в ленте.</p>
+  </div>
+  <div class="console rise" style="--n:2" aria-hidden="true">
+    <div class="bar"><i></i><i></i><i></i><span>Текст для озвучки</span></div>
+    <div class="typed"><span id="typed"></span><span class="caret"></span></div>
+    <div class="eq" id="eq"></div>
+    <div class="params"><span>Voice <b id="pVoice">alice</b></span><span>Stability <b id="pStab">0.45</b></span><span>Speed <b>1.00</b></span><span>Lang <b>ru</b></span></div>
+  </div>
+</section>
+
+<section id="features" class="wrap">
+  <div class="rise"><p class="eyebrow">// между текстом и таймлайном</p><h2>Убрали всю возню <span class="grad">вокруг генерации</span></h2></div>
+  <div class="feats">
+    <div class="card wide rise"><h3>Лента дублей, которая всё помнит</h3><p>Каждая попытка лежит в ленте вместе с настройками. Кликнули по старому дублю — текст, голос и ползунки вернулись в редактор.</p></div>
+    <div class="card wide rise" style="--n:1"><h3>Drag to DaVinci</h3><p>Сохранили дубль и тащите его мышью на дорожку. Никаких «куда же оно скачалось».</p></div>
+    <div class="card rise"><span class="num grad" data-count="4">4</span><h3>стандарта громкости</h3><p>От −14 LUFS для YouTube до −23 для ТВ, с лимитером пиков. Оригинал не меняется.</p></div>
+    <div class="card rise" style="--n:1"><span class="num grad" data-count="7">7</span><h3>тем оформления</h3><p>Под настроение и под монтажную. Меняются мгновенно, без перезапуска.</p></div>
+    <div class="card rise" style="--n:2"><span class="num grad" data-count="7">7</span><h3>дней живут дубли</h3><p>Кэш сам убирает старые попытки, а сохранённые файлы остаются в вашей папке.</p></div>
+    <div class="card wide rise"><h3>Бесшовная склейка</h3><p>Передайте соседние фразы как контекст, и реплики зазвучат одним дыханием, а не набором кусков.</p></div>
+    <div class="card wide rise" style="--n:1"><h3>Воспроизводимый результат</h3><p>Seed записывается в дубль. Удачную интонацию можно взять за основу следующей реплики.</p></div>
+  </div>
+</section>
+
+<section id="voices" class="wrap split">
+  <div class="rise">
+    <p class="eyebrow">// кастинг</p>
+    <h2>Капитан, пришелец, ИИ корабля. <span class="grad">У каждого свой голос</span></h2>
+    <p class="sub">Прослушайте бесплатный английский сэмпл и русский, который генерируется один раз и остаётся в кэше. Сохраните находку как персонажа: при выборе вернутся и голос, и настройки.</p>
+    <div class="voice-tags"><span>alice</span><span>george</span><span>aria</span><span>brian</span><span>lily</span><span>+ свой ID</span></div>
+  </div>
+  <div class="stage rise" style="--n:2">
+    <div class="tilt" data-tilt>
+      <div class="win"><img src="assets/voices.webp" width="1860" height="1140" loading="lazy" alt="Каталог голосов с фильтрами, карточками и профилями персонажей"></div>
     </div>
-  </section>
+  </div>
+</section>
 
-  <section id="start">
-    <h2>Как начать</h2>
-    <ol class="steps">
-      <li><h3>Скачайте</h3><p>Положите <code>TTS-Studio.exe</code> в отдельную папку: рядом с ним появятся настройки и кэш.</p></li>
-      <li><h3>Введите ключ</h3><p>Нужен API-ключ <a href="https://openrouter.ai/keys">OpenRouter</a>. Генерация оплачивается там же, по тарифам выбранной модели.</p></li>
-      <li><h3>Озвучивайте</h3><p>Выберите голос, напишите текст и нажмите <code>Ctrl + Enter</code>.</p></li>
+<section id="themes" class="wrap">
+  <div class="rise"><p class="eyebrow">// семь настроений</p><h2>Выберите свой <span class="grad">монтажный стол</span></h2></div>
+  <div class="fan rise" id="fan"></div>
+</section>
+
+<section id="update" class="wrap">
+  <div class="update rise">
+    <div>
+      <p class="eyebrow">// обновления</p>
+      <h2>Нажали «Обновить». <span class="grad">Всё.</span></h2>
+      <p class="sub">Ни браузера, ни установщика. Программа сама скачает новую версию, заменит себя и откроется снова. Настройки, ключ, дубли и текст в редакторе останутся на месте.</p>
+    </div>
+    <ol class="pipe" id="pipe" aria-label="Этапы обновления">
+      <li><i>1</i>Нашла новую версию на GitHub</li>
+      <li><i>2</i>Скачала и сверила контрольную сумму</li>
+      <li><i>3</i>Заменила свой файл</li>
+      <li><i>✓</i>Открылась уже обновлённой</li>
     </ol>
-    <p class="note"><b>Если Windows покажет предупреждение SmartScreen:</b> программа пока не подписана сертификатом. Нажмите «Подробнее», затем «Выполнить в любом случае». Исходный код открыт, а сборка выполняется на GitHub Actions.</p>
-    <p class="note"><b>Где хранится ключ:</b> в файле <code>config.json</code> рядом с программой, в открытом виде. Не передавайте этот файл другим людям. На сервер ключ отправляется только в OpenRouter.</p>
-  </section>
+  </div>
+</section>
 
-  <footer>
-    <span>TTS Studio. Независимый проект, не связан с ElevenLabs и OpenRouter.</span>
-    <span><a href="https://github.com/FreeSize83/tts-studio">Исходный код</a> · <a href="https://github.com/FreeSize83/tts-studio/releases">Все версии</a></span>
-  </footer>
-</div>
+<section id="start" class="wrap">
+  <div class="rise"><p class="eyebrow">// старт за минуту</p><h2>Три шага до первой реплики</h2></div>
+  <ol class="steps">
+    <li class="rise"><h3>Скачайте</h3><p>Положите <code>TTS-Studio.exe</code> в отдельную папку: рядом появятся настройки и кэш.</p></li>
+    <li class="rise" style="--n:1"><h3>Введите ключ</h3><p>Нужен API-ключ <a href="https://openrouter.ai/keys">OpenRouter</a>. Генерация оплачивается там же, по тарифам выбранной модели.</p></li>
+    <li class="rise" style="--n:2"><h3>Озвучивайте</h3><p>Выберите голос, напишите текст и нажмите <code>Ctrl + Enter</code>.</p></li>
+  </ol>
+  <p class="note rise"><b>Если Windows покажет SmartScreen:</b> программа пока не подписана сертификатом. Нажмите «Подробнее», затем «Выполнить в любом случае». Исходный код открыт, сборка идёт на GitHub Actions.</p>
+  <p class="note rise"><b>Где хранится ключ:</b> в <code>config.json</code> рядом с программой, в открытом виде. Не передавайте этот файл другим людям. На сервер ключ уходит только в OpenRouter.</p>
+</section>
+
+<section class="wrap final rise">
+  <h2>Первая реплика <span class="grad">уже ждёт</span></h2>
+  <div class="cta"><a class="btn" href="https://github.com/FreeSize83/tts-studio/releases/latest/download/TTS-Studio.exe">Скачать TTS Studio</a></div>
+</section>
+
+<div class="wrap"><footer>
+  <span>TTS Studio. Независимый проект, не связан с ElevenLabs и OpenRouter.</span>
+  <span><a href="https://github.com/FreeSize83/tts-studio">Исходный код</a> · <a href="https://github.com/FreeSize83/tts-studio/releases">Все версии</a></span>
+</footer></div>
+
+<dialog id="zoom"><img alt="Скриншот TTS Studio в полном размере"></dialog>
+
 <script>
-var wave = document.getElementById("wave"), n = 120;
-for (var i = 0; i < n; i++) {
-  var b = document.createElement("i"), x = i / n * Math.PI * 7;
-  b.style.setProperty("--h", Math.round(18 + 78 * Math.abs(Math.sin(x) * Math.sin(x * 2.3 + 1) * .7 + Math.sin(x * .6) * .3)));
-  b.style.setProperty("--d", (i % 17 / 17 * 2.6).toFixed(2));
-  wave.appendChild(b);
-}
-fetch("https://api.github.com/repos/FreeSize83/tts-studio/releases/latest").then(function (r) { return r.ok ? r.json() : null; }).then(function (j) {
-  if (!j) return;
-  var a = (j.assets || []).filter(function (x) { return x.name === "TTS-Studio.exe"; })[0];
-  document.getElementById("rel").textContent = j.tag_name + (a ? " · " + Math.round(a.size / 1048576) + " МБ" : "") + " · установка не нужна";
-}).catch(function () {});
+(function () {
+  var still = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var $ = function (id) { return document.getElementById(id); };
+  var mouse = { x: .5, y: .5, sx: .5, sy: .5 };
+  addEventListener("pointermove", function (e) { mouse.x = e.clientX / innerWidth; mouse.y = e.clientY / innerHeight; }, { passive: true });
+
+  /* ---------- Фон: плавающая «аврора» на WebGL. Рисуется в низком разрешении: она мягкая, а GPU не греется даже на 4K */
+  var aurora = $("aurora"), gl = aurora.getContext("webgl", { antialias: false, alpha: false, powerPreference: "low-power" }), uT, uM, uS;
+  if (gl) {
+    var vs = "attribute vec2 p;void main(){gl_Position=vec4(p,0.,1.);}";
+    var fs = [
+      "precision mediump float;uniform float t;uniform vec2 m;uniform float sc;uniform vec2 r;",
+      "float n(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.-2.*f);",
+      "float a=fract(sin(dot(i,vec2(127.1,311.7)))*43758.5),b=fract(sin(dot(i+vec2(1,0),vec2(127.1,311.7)))*43758.5),",
+      "c=fract(sin(dot(i+vec2(0,1),vec2(127.1,311.7)))*43758.5),d=fract(sin(dot(i+vec2(1,1),vec2(127.1,311.7)))*43758.5);",
+      "return mix(mix(a,b,f.x),mix(c,d,f.x),f.y);}",
+      "float fbm(vec2 p){float v=0.,a=.5;for(int i=0;i<4;i++){v+=a*n(p);p=p*2.03+vec2(7.,3.);a*=.5;}return v;}",
+      "void main(){vec2 u=gl_FragCoord.xy/r;vec2 p=u*vec2(r.x/r.y,1.)*1.7;p+=(m-.5)*.25;p.y+=sc*.8;",
+      "vec2 q=vec2(fbm(p+t*.05),fbm(p+vec2(5.2,1.3)-t*.04));",
+      "float f=fbm(p+2.6*q+vec2(t*.03,-t*.02));",
+      "vec3 c=vec3(.045,.035,.06);",
+      "c=mix(c,vec3(.62,.13,.17),smoothstep(.38,.8,f)*.85);",
+      "c=mix(c,vec3(1.,.47,.14),smoothstep(.56,.92,f+q.x*.22)*.8);",
+      "c=mix(c,vec3(.34,.15,.72),smoothstep(.42,.9,q.y)*.62);",
+      "c=mix(c,vec3(.85,.14,.46),smoothstep(.62,.95,q.x)*.45);",
+      "c*=.5;c*=1.-.45*length(u-.5);gl_FragColor=vec4(c,1.);}"
+    ].join("");
+    var sh = function (type, src) { var s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); return s; };
+    var pr = gl.createProgram();
+    gl.attachShader(pr, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(pr, sh(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(pr);
+    if (gl.getProgramParameter(pr, gl.LINK_STATUS)) {
+      gl.useProgram(pr); gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(0); gl.bindAttribLocation(pr, 0, "p"); gl.vertexAttribPointer(gl.getAttribLocation(pr, "p"), 2, gl.FLOAT, false, 0, 0);
+      uT = gl.getUniformLocation(pr, "t"); uM = gl.getUniformLocation(pr, "m"); uS = gl.getUniformLocation(pr, "sc");
+    } else gl = null;
+  }
+
+  /* ---------- Фон: звуковые ленты поверх авроры, реагируют на мышь */
+  var rib = $("ribbons"), ctx = rib.getContext("2d"), W = 0, H = 0, dpr = 1;
+  var bands = [
+    { y: .28, amp: .13, sp: .22, k: 2.1, c: "255,146,72", n: 14 },
+    { y: .56, amp: .17, sp: -.16, k: 1.5, c: "255,61,139", n: 12 },
+    { y: .8, amp: .11, sp: .13, k: 2.7, c: "154,107,255", n: 12 }
+  ];
+  function resize() {
+    dpr = Math.min(devicePixelRatio || 1, 1.5); W = innerWidth; H = innerHeight;
+    rib.width = W * dpr; rib.height = H * dpr;
+    if (gl) { aurora.width = Math.ceil(W / 3); aurora.height = Math.ceil(H / 3); gl.viewport(0, 0, aurora.width, aurora.height); gl.uniform2f(gl.getUniformLocation(pr, "r"), aurora.width, aurora.height); }
+  }
+  addEventListener("resize", resize); resize();
+
+  function draw(ms) {
+    var t = ms / 1000; mouse.sx += (mouse.x - mouse.sx) * .05; mouse.sy += (mouse.y - mouse.sy) * .05;
+    var sc = scrollY / Math.max(1, document.documentElement.scrollHeight - innerHeight);
+    if (gl) { gl.uniform1f(uT, t + 40); gl.uniform2f(uM, mouse.sx, 1 - mouse.sy); gl.uniform1f(uS, sc); gl.drawArrays(gl.TRIANGLES, 0, 3); }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, W, H); ctx.globalCompositeOperation = "lighter"; ctx.lineWidth = 1;
+    var step = Math.max(10, W / 90);
+    bands.forEach(function (b, bi) {
+      for (var j = 0; j < b.n; j++) {
+        var f = j / b.n, ph = t * b.sp + f * 1.15 + bi * 2;
+        ctx.beginPath();
+        for (var x = -step; x <= W + step; x += step) {
+          var u = x / W, d = u - mouse.sx, near = Math.exp(-d * d * 28);
+          var a = Math.sin(u * b.k * 6.28 + ph) * .62 + Math.sin(u * b.k * 2.7 * 6.28 - ph * 1.7 + f * 2) * .28 + Math.sin(u * 14 + t * .9 + f * 5) * .1;
+          var y = H * (b.y - sc * .12 * (bi + 1) + (mouse.sy - .5) * near * .13 * (f - .5) * 2) + a * H * b.amp * (.35 + f * .8) * (1 + near * .55);
+          if (x < 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.strokeStyle = "rgba(" + b.c + "," + (.05 + .2 * Math.sin(f * 3.14)) + ")";
+        ctx.stroke();
+      }
+    });
+    if (!still && !document.hidden) requestAnimationFrame(draw);
+  }
+  requestAnimationFrame(draw);
+  document.addEventListener("visibilitychange", function () { if (!document.hidden && !still) requestAnimationFrame(draw); });
+
+  /* ---------- Вращающееся слово в заголовке */
+  var rotor = $("rotor").children, ri = 0;
+  if (!still) setInterval(function () { rotor[ri].classList.remove("on"); ri = (ri + 1) % rotor.length; rotor[ri].classList.add("on"); }, 2600);
+
+  /* ---------- Скриншот в герое: темы сменяются сами, чипы переключают вручную */
+  var THEMES = [["DaVinci Studio", "davinci", "255,146,72"], ["Midnight Pro", "midnight", "91,157,255"], ["Neon Synthwave", "neon", "255,61,200"],
+                ["Emerald", "emerald", "60,210,140"], ["Nord Frost", "nord", "136,192,208"], ["Graphite Mono", "graphite", "200,200,205"], ["Studio Light", "studio", "255,170,110"]];
+  var frames = $("frames"), chips = $("chips"), heroStage = $("heroStage"), cur = 0, auto = null;
+  THEMES.forEach(function (th, i) {
+    var b = document.createElement("button"); b.type = "button"; b.textContent = th[0]; if (!i) b.classList.add("on");
+    b.addEventListener("click", function () { clearInterval(auto); showTheme(i); }); chips.appendChild(b);
+    if (i) { var im = new Image(); im.width = 2160; im.height = 1350; im.alt = ""; im.loading = "lazy"; im.src = "assets/theme-" + th[1] + ".webp"; frames.appendChild(im); }
+  });
+  function showTheme(i) {
+    frames.children[cur].classList.remove("on"); chips.children[cur].classList.remove("on"); cur = i;
+    frames.children[cur].classList.add("on"); chips.children[cur].classList.add("on");
+    $("themeName").textContent = "TTS Studio — " + THEMES[i][0]; heroStage.style.setProperty("--glow", THEMES[i][2]);
+  }
+  if (!still) auto = setInterval(function () { showTheme((cur + 1) % THEMES.length); }, 3800);
+
+  /* ---------- 3D-наклон за курсором и «раскрытие» окна при прокрутке */
+  var tilts = [].slice.call(document.querySelectorAll("[data-tilt]"));
+  if (!still) {
+    tilts.forEach(function (el) {
+      var box = el.parentElement;
+      box.addEventListener("pointermove", function (e) {
+        if (e.pointerType === "touch") return;
+        var r = box.getBoundingClientRect();
+        el.dataset.hx = ((e.clientX - r.left) / r.width - .5) * 9; el.dataset.hy = ((e.clientY - r.top) / r.height - .5) * -7; apply();
+      });
+      box.addEventListener("pointerleave", function () { el.dataset.hx = 0; el.dataset.hy = 0; apply(); });
+    });
+    var apply = function () {
+      tilts.forEach(function (el) {
+        var r = el.parentElement.getBoundingClientRect(), p = Math.min(1, Math.max(0, (innerHeight * .95 - r.top) / (innerHeight * .75)));
+        el.style.setProperty("--rx", ((1 - p) * 22 + Number(el.dataset.hy || 0)).toFixed(2) + "deg");
+        el.style.setProperty("--ry", Number(el.dataset.hx || 0).toFixed(2) + "deg");
+        el.style.setProperty("--s", (.9 + p * .1).toFixed(3));
+      });
+    };
+    addEventListener("scroll", apply, { passive: true }); addEventListener("resize", apply); apply();
+  }
+
+  /* ---------- Бегущая строка */
+  var words = ["[whispering]", "[cold]", "[sighs]", "[monotone]", "[long pause]", "[robotic]", "[flat delivery]", "[short pause]"];
+  $("ticker").innerHTML = words.concat(words, words, words).map(function (w) { return "<span>" + w + "</span>"; }).join("");
+
+  /* ---------- Живой редактор: печатает реплику и «озвучивает» её эквалайзером */
+  var LINES = [["alice", "0.45", "[whispering] Они уже внутри станции. Не включай свет."], ["george", "0.95", "[monotone, cold] Система активна. Начинаю протокол проверки."],
+               ["aria", "0.30", "[sighs] Ну вот. Опять всё придётся переснимать."], ["brian", "0.70", "Добро пожаловать на борт. [short pause] Пристегните ремни."]];
+  var eq = $("eq"), bars = [], typed = $("typed"), li = 0, level = 0;
+  for (var i = 0; i < 46; i++) { var bar = document.createElement("i"); eq.appendChild(bar); bars.push(bar); }
+  function esc(s) { return s.replace(/\[[^\]]*\]?/g, function (m) { return "<em>" + m + "</em>"; }); }
+  function play() {
+    var L = LINES[li]; li = (li + 1) % LINES.length; $("pVoice").textContent = L[0]; $("pStab").textContent = L[1];
+    var n = 0, text = L[2];
+    (function tick() {
+      n++; typed.innerHTML = esc(text.slice(0, n));
+      if (n < text.length) return setTimeout(tick, 34 + Math.random() * 42);
+      level = 1; setTimeout(function () { level = 0; setTimeout(play, 700); }, 2400);
+    })();
+  }
+  if (still) { typed.innerHTML = esc(LINES[0][2]); } else { play(); }
+  var lv = 0;
+  (function eqLoop(ms) {
+    lv += (level - lv) * .08; var t = (ms || 0) / 1000;
+    if (!document.hidden) bars.forEach(function (b, k) {
+      var v = Math.abs(Math.sin(k * .55 + t * 7) * Math.sin(k * .17 - t * 3.1) + Math.sin(k * 1.3 + t * 11) * .3);
+      b.style.transform = "scaleY(" + (.05 + lv * Math.min(.95, v)).toFixed(3) + ")";
+    });
+    if (!still) requestAnimationFrame(eqLoop);
+  })();
+
+  /* ---------- Веер тем с увеличением по клику */
+  var fan = $("fan"), zoom = $("zoom"), zi = zoom.querySelector("img"), order = [5, 2, 4, 0, 1, 3, 6];
+  order.forEach(function (ti, pos) {
+    var th = THEMES[ti], off = pos - 3, b = document.createElement("button"); b.type = "button"; b.style.setProperty("--i", off); b.style.setProperty("--a", Math.abs(off));
+    b.innerHTML = '<img src="assets/theme-' + th[1] + '.webp" width="2160" height="1350" loading="lazy" alt="Тема ' + th[0] + '"><span>' + th[0] + "</span>";
+    b.addEventListener("click", function () { zi.src = "assets/theme-" + th[1] + ".webp"; zoom.showModal(); }); fan.appendChild(b);
+  });
+  zoom.addEventListener("click", function () { zoom.close(); });
+
+  /* ---------- Подсветка под курсором на карточках */
+  [].forEach.call(document.querySelectorAll(".card"), function (c) {
+    c.addEventListener("pointermove", function (e) { var r = c.getBoundingClientRect(); c.style.setProperty("--x", e.clientX - r.left + "px"); c.style.setProperty("--y", e.clientY - r.top + "px"); });
+  });
+
+  /* ---------- Появление при прокрутке, счётчики, этапы обновления */
+  var pipe = $("pipe"), pipeRun = false;
+  function runPipe() {
+    if (pipeRun) return; pipeRun = true; var k = 0, items = pipe.children;
+    (function next() {
+      if (k < items.length) { items[k++].classList.add("on"); return setTimeout(next, 750); }
+      setTimeout(function () { [].forEach.call(items, function (x) { x.classList.remove("on"); }); k = 0; setTimeout(next, 600); }, 2600);
+    })();
+  }
+  function count(el) {
+    var end = +el.dataset.count, t0 = performance.now();
+    (function f(now) { var p = Math.min(1, (now - t0) / 900); el.textContent = Math.round(p * end); if (p < 1) requestAnimationFrame(f); })(t0);
+  }
+  if (still || !("IntersectionObserver" in window)) {
+    [].forEach.call(document.querySelectorAll(".rise"), function (x) { x.classList.add("in"); });
+    [].forEach.call(pipe.children, function (x) { x.classList.add("on"); });
+  } else {
+    var io = new IntersectionObserver(function (es) {
+      es.forEach(function (e) {
+        if (!e.isIntersecting) return; io.unobserve(e.target); e.target.classList.add("in");
+        var num = e.target.querySelector("[data-count]"); if (num) count(num);
+        if (e.target.querySelector("#pipe")) runPipe();
+      });
+    }, { threshold: .12 });
+    [].forEach.call(document.querySelectorAll(".rise"), function (x) { io.observe(x); });
+  }
+
+  /* ---------- Актуальная версия и размер из GitHub */
+  fetch("https://api.github.com/repos/FreeSize83/tts-studio/releases/latest").then(function (r) { return r.ok ? r.json() : null; }).then(function (j) {
+    if (!j) return;
+    var a = (j.assets || []).filter(function (x) { return x.name === "TTS-Studio.exe"; })[0];
+    $("rel").textContent = j.tag_name + (a ? " · " + Math.round(a.size / 1048576) + " МБ" : "") + " · установка не нужна";
+  }).catch(function () {});
+})();
 </script>
 </body>
 </html>
