@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller==6.22.3
+
+      - name: Check that the tag matches APP_VERSION
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path tts_studio.py -Pattern '^APP_VERSION = "([^"]+)"').Matches[0].Groups[1].Value
+          if ("v$v" -ne "${{ github.ref_name }}") { throw "Tag ${{ github.ref_name }} does not match APP_VERSION $v" }
+
+      - name: Build exe
+        run: >
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name TTS-Studio --icon tts_studio.ico
+          --hidden-import _cffi_backend
+          --exclude-module tkinter --exclude-module PIL
+          --exclude-module PyQt6.QtWebEngineCore --exclude-module PyQt6.QtQml
+          --exclude-module PyQt6.QtQuick --exclude-module PyQt6.Qt3DCore --exclude-module PyQt6.QtPdf
+          tts_studio.py
+
+      - name: Write checksum
+        shell: pwsh
+        run: (Get-FileHash dist/TTS-Studio.exe -Algorithm SHA256).Hash.ToLower() | Set-Content dist/TTS-Studio.exe.sha256 -NoNewline -Encoding ascii
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create ${{ github.ref_name }} dist/TTS-Studio.exe dist/TTS-Studio.exe.sha256 --title "TTS Studio ${{ github.ref_name }}" --generate-notes

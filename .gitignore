@@ -1,0 +1,16 @@
+# Личные данные пользователя: API-ключ, настройки, дубли
+config.json
+cache_takes/
+voice_previews/
+
+# Сборка и окружение
+.venv/
+_build/
+dist/
+release/
+*.exe
+*.spec
+__pycache__/
+
+# Локальные копии
+*.prev.py

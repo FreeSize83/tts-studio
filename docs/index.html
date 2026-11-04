@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TTS Studio — озвучка на ElevenLabs для видео и игр</title>
+<meta name="description" content="Настольная студия озвучки для Windows: голоса ElevenLabs через OpenRouter, дубли, персонажи, нормализация громкости и перетаскивание в DaVinci Resolve.">
+<meta property="og:title" content="TTS Studio">
+<meta property="og:description" content="Настольная студия озвучки для Windows: дубли, персонажи, нормализация и Drag to DaVinci.">
+<meta property="og:image" content="https://freesize83.github.io/tts-studio/assets/main.png">
+<link rel="icon" href="assets/icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Manrope:wght@400;500;700;800&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #141415; --panel: #1d1d1f; --raised: #262629; --line: #333337;
+  --text: #ecebe8; --dim: #a3a2a6; --accent: #e8833a; --accent2: #c4452f; --soft: #ffb27a;
+  --mono: "JetBrains Mono", Consolas, monospace;
+  --sans: "Manrope", "Segoe UI", system-ui, sans-serif;
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 500 17px/1.6 var(--sans); overflow-x: hidden; }
+img { display: block; max-width: 100%; height: auto; }
+a { color: inherit; }
+.wrap { width: min(1160px, 100% - 40px); margin-inline: auto; }
+
+nav { display: flex; align-items: center; justify-content: space-between; padding: 20px 0; gap: 16px; }
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 800; text-decoration: none; }
+.brand img { width: 32px; height: 32px; }
+nav ul { display: flex; gap: 26px; list-style: none; margin: 0; padding: 0; font-size: 15px; color: var(--dim); }
+nav ul a { text-decoration: none; }
+nav ul a:hover { color: var(--text); }
+
+.hero { padding: 64px 0 0; }
+.kicker { font: 400 13px var(--mono); color: var(--soft); letter-spacing: .04em; margin: 0 0 18px; }
+h1 { font-size: clamp(40px, 7vw, 84px); line-height: 1.04; letter-spacing: -.035em; font-weight: 800; margin: 0; max-width: 13em; }
+h1 em { font-style: normal; color: var(--accent); }
+.lead { font-size: clamp(18px, 2vw, 21px); color: var(--dim); max-width: 36em; margin: 26px 0 34px; }
+.cta { display: flex; flex-wrap: wrap; align-items: center; gap: 14px 22px; }
+.btn { display: inline-flex; align-items: center; gap: 10px; padding: 15px 26px; border-radius: 8px; font-weight: 800; text-decoration: none;
+  background: linear-gradient(90deg, var(--accent2), var(--accent)); color: #111; transition: transform .15s; }
+.btn:hover { transform: translateY(-2px); }
+.btn:focus-visible, a:focus-visible { outline: 2px solid var(--soft); outline-offset: 3px; }
+.meta { font: 400 13px var(--mono); color: var(--dim); }
+.ghost { color: var(--dim); font-size: 15px; }
+.ghost:hover { color: var(--text); }
+
+.wave { display: flex; align-items: flex-end; gap: 4px; height: 76px; margin: 56px 0 -1px; overflow: hidden; }
+.wave i { flex: 1 0 5px; min-width: 5px; background: linear-gradient(0deg, var(--accent2), var(--accent)); border-radius: 3px 3px 0 0;
+  height: calc(var(--h) * 1%); transform-origin: bottom; animation: pulse 2.6s ease-in-out infinite; animation-delay: calc(var(--d) * -1s); }
+@keyframes pulse { 50% { transform: scaleY(.45); } }
+@media (prefers-reduced-motion: reduce) { .wave i { animation: none; } .btn { transition: none; } html { scroll-behavior: auto; } }
+
+.shot { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--panel); }
+.hero .shot { box-shadow: 0 40px 90px -40px rgba(232, 131, 58, .45); }
+
+section { padding: 96px 0 0; }
+h2 { font-size: clamp(30px, 4vw, 46px); line-height: 1.12; letter-spacing: -.025em; font-weight: 800; margin: 0 0 16px; max-width: 18em; }
+.sub { color: var(--dim); max-width: 38em; margin: 0; }
+
+.feats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; margin-top: 44px; }
+.feats div { background: var(--panel); padding: 28px; }
+.feats h3 { margin: 0 0 8px; font-size: 19px; font-weight: 800; }
+.feats p { margin: 0; color: var(--dim); font-size: 15.5px; }
+.feats code, .steps code { font: 400 .9em var(--mono); color: var(--soft); }
+
+.split { display: grid; grid-template-columns: 1fr 1.5fr; gap: 56px; align-items: center; }
+
+.update { display: grid; grid-template-columns: 1.2fr 1fr; gap: 56px; align-items: center; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: clamp(28px, 5vw, 56px); }
+.update ol { list-style: none; margin: 0; padding: 0; font: 400 14px var(--mono); }
+.update li { padding: 13px 0; border-top: 1px solid var(--line); color: var(--dim); display: flex; justify-content: space-between; gap: 14px; }
+.update li:first-child { border-top: 0; }
+.update li b { color: var(--soft); font-weight: 600; white-space: nowrap; }
+
+.themes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 40px; }
+.themes figure { margin: 0; }
+.themes figcaption { font: 400 13px var(--mono); color: var(--dim); margin-top: 10px; }
+
+.steps { counter-reset: s; list-style: none; padding: 0; margin: 40px 0 0; display: grid; grid-template-columns: repeat(3, 1fr); gap: 32px; }
+.steps li { counter-increment: s; }
+.steps li::before { content: counter(s); display: block; font: 800 44px var(--sans); color: var(--accent); line-height: 1; margin-bottom: 12px; }
+.steps h3 { margin: 0 0 6px; font-size: 19px; font-weight: 800; }
+.steps p { margin: 0; color: var(--dim); font-size: 15.5px; }
+.note { margin-top: 36px; padding: 18px 22px; border-left: 3px solid var(--accent); background: var(--panel); color: var(--dim); font-size: 15.5px; }
+.note b { color: var(--text); }
+
+footer { margin-top: 96px; padding: 28px 0 40px; border-top: 1px solid var(--line); color: var(--dim); font-size: 14px; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; }
+
+@media (max-width: 860px) {
+  nav ul { display: none; }
+  .hero { padding-top: 32px; }
+  .feats, .themes, .steps, .split, .update { grid-template-columns: 1fr; }
+  .split, .update { gap: 28px; }
+  section { padding-top: 72px; }
+  .btn { width: 100%; justify-content: center; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav>
+    <a class="brand" href="#top"><img src="assets/icon.png" alt="" width="32" height="32">TTS Studio</a>
+    <ul>
+      <li><a href="#features">Возможности</a></li>
+      <li><a href="#voices">Голоса</a></li>
+      <li><a href="#update">Обновления</a></li>
+      <li><a href="#start">Как начать</a></li>
+      <li><a href="https://github.com/FreeSize83/tts-studio">GitHub</a></li>
+    </ul>
+  </nav>
+
+  <header class="hero" id="top">
+    <p class="kicker">Windows · OpenRouter × ElevenLabs v4</p>
+    <h1>Рабочий стол для <em>озвучки</em>, а не окно API</h1>
+    <p class="lead">Пишите реплику, слушайте дубли, подбирайте голос персонажу и перетаскивайте готовый файл прямо на таймлайн DaVinci Resolve.</p>
+    <div class="cta">
+      <a class="btn" href="https://github.com/FreeSize83/tts-studio/releases/latest/download/TTS-Studio.exe">Скачать для Windows</a>
+      <span class="meta" id="rel">Один .exe, установка не нужна</span>
+    </div>
+    <div class="wave" id="wave" aria-hidden="true"></div>
+    <div class="shot"><img src="assets/main.png" width="1440" height="876" alt="Главное окно TTS Studio: настройки голоса слева, плеер и лента дублей справа"></div>
+  </header>
+
+  <section id="features">
+    <h2>Всё, что нужно между текстом и таймлайном</h2>
+    <div class="feats">
+      <div><h3>Лента дублей</h3><p>Каждая генерация сохраняется с её настройками: можно переслушать, вернуть текст в редактор и повторить seed. Кэш чистится сам через 7 дней.</p></div>
+      <div><h3>Drag to DaVinci</h3><p>Сохранённый дубль перетаскивается мышью в DaVinci Resolve или другую программу, без поиска файла в папках.</p></div>
+      <div><h3>Громкость по стандарту</h3><p>Нормализация к LUFS при сохранении, с мягким лимитером пиков. Оригинал в кэше не меняется.</p></div>
+      <div><h3>Ударения и теги</h3><p>Ударение ставится одной кнопкой, эмоции — тегами вроде <code>[whispering]</code> и <code>[sighs]</code>. Можно добавить свои.</p></div>
+      <div><h3>Бесшовная склейка</h3><p>Передайте соседние фразы как контекст, и реплики будут лучше звучать вместе. Stability, Similarity, Style и Speed настраиваются ползунками.</p></div>
+      <div><h3>Семь тем</h3><p>От DaVinci Studio до Neon Synthwave. Тема меняется сразу, перезапуск не нужен.</p></div>
+    </div>
+  </section>
+
+  <section id="voices" class="split">
+    <div>
+      <h2>Голос для каждого персонажа</h2>
+      <p class="sub">Каталог с фильтрами по полу и поиском по описанию. Английский сэмпл бесплатный, русский генерируется один раз и остаётся в кэше. Собирайте персонажей в профили проектов: выбрали персонажа — вернулись его голос и настройки.</p>
+    </div>
+    <div class="shot"><img src="assets/voices.png" width="1240" height="640" loading="lazy" alt="Каталог голосов с карточками, фильтрами и профилями персонажей"></div>
+  </section>
+
+  <section id="update">
+    <div class="update">
+      <div>
+        <h2>Обновление — одна кнопка</h2>
+        <p class="sub">Нажмите «Обновить» в программе, и она заменит себя новой версией и перезапустится. Браузер и установщик не нужны. Настройки, API-ключ, дубли и текст в редакторе остаются на месте.</p>
+      </div>
+      <ol>
+        <li>Проверка версии <b>GitHub Releases</b></li>
+        <li>Скачивание <b>SHA-256</b></li>
+        <li>Замена файла <b>без установщика</b></li>
+        <li>Перезапуск <b>сразу</b></li>
+      </ol>
+    </div>
+  </section>
+
+  <section>
+    <h2>Семь тем на любой монтажный стол</h2>
+    <div class="themes">
+      <figure><div class="shot"><img src="assets/midnight.png" width="1440" height="876" loading="lazy" alt="Тема Midnight Pro"></div><figcaption>Midnight Pro</figcaption></figure>
+      <figure><div class="shot"><img src="assets/neon.png" width="1440" height="876" loading="lazy" alt="Тема Neon Synthwave"></div><figcaption>Neon Synthwave</figcaption></figure>
+      <figure><div class="shot"><img src="assets/light.png" width="1440" height="876" loading="lazy" alt="Тема Studio Light"></div><figcaption>Studio Light</figcaption></figure>
+    </div>
+  </section>
+
+  <section id="start">
+    <h2>Как начать</h2>
+    <ol class="steps">
+      <li><h3>Скачайте</h3><p>Положите <code>TTS-Studio.exe</code> в отдельную папку: рядом с ним появятся настройки и кэш.</p></li>
+      <li><h3>Введите ключ</h3><p>Нужен API-ключ <a href="https://openrouter.ai/keys">OpenRouter</a>. Генерация оплачивается там же, по тарифам выбранной модели.</p></li>
+      <li><h3>Озвучивайте</h3><p>Выберите голос, напишите текст и нажмите <code>Ctrl + Enter</code>.</p></li>
+    </ol>
+    <p class="note"><b>Если Windows покажет предупреждение SmartScreen:</b> программа пока не подписана сертификатом. Нажмите «Подробнее», затем «Выполнить в любом случае». Исходный код открыт, а сборка выполняется на GitHub Actions.</p>
+    <p class="note"><b>Где хранится ключ:</b> в файле <code>config.json</code> рядом с программой, в открытом виде. Не передавайте этот файл другим людям. На сервер ключ отправляется только в OpenRouter.</p>
+  </section>
+
+  <footer>
+    <span>TTS Studio. Независимый проект, не связан с ElevenLabs и OpenRouter.</span>
+    <span><a href="https://github.com/FreeSize83/tts-studio">Исходный код</a> · <a href="https://github.com/FreeSize83/tts-studio/releases">Все версии</a></span>
+  </footer>
+</div>
+<script>
+var wave = document.getElementById("wave"), n = 120;
+for (var i = 0; i < n; i++) {
+  var b = document.createElement("i"), x = i / n * Math.PI * 7;
+  b.style.setProperty("--h", Math.round(18 + 78 * Math.abs(Math.sin(x) * Math.sin(x * 2.3 + 1) * .7 + Math.sin(x * .6) * .3)));
+  b.style.setProperty("--d", (i % 17 / 17 * 2.6).toFixed(2));
+  wave.appendChild(b);
+}
+fetch("https://api.github.com/repos/FreeSize83/tts-studio/releases/latest").then(function (r) { return r.ok ? r.json() : null; }).then(function (j) {
+  if (!j) return;
+  var a = (j.assets || []).filter(function (x) { return x.name === "TTS-Studio.exe"; })[0];
+  document.getElementById("rel").textContent = j.tag_name + (a ? " · " + Math.round(a.size / 1048576) + " МБ" : "") + " · установка не нужна";
+}).catch(function () {});
+</script>
+</body>
+</html>
