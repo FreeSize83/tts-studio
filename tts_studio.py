@@ -10,7 +10,7 @@ from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QUrl, QMimeData, QTimer, QReg
 from PyQt6.QtGui import (QColor, QCursor, QDesktopServices, QDrag, QIcon, QImage, QKeySequence, QLinearGradient, QOpenGLContext, QPainter, QPainterPath,
                          QPalette, QPixmap, QRadialGradient, QShortcut, QRegularExpressionValidator, QVector2D, QVector3D)
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
-from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QGraphicsDropShadowEffect,
+from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFrame, QGraphicsDropShadowEffect,
                              QGraphicsOpacityEffect, QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
                              QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QRadioButton, QScrollArea, QSizePolicy,
                              QSlider, QSplitter, QStackedWidget, QToolButton, QVBoxLayout, QWidget, QLayout)
@@ -26,7 +26,7 @@ try:  # нормализация громкости (numpy + miniaudio для д
 except Exception as _e:
     AUDIO_OK, AUDIO_ERR = False, f"{type(_e).__name__}: {_e}"
 
-APP_VERSION = "1.1.0"  # должна совпадать с git-тегом релиза (v1.0.0): это проверяет сборка в GitHub Actions
+APP_VERSION = "1.2.0"  # должна совпадать с git-тегом релиза (v1.0.0): это проверяет сборка в GitHub Actions
 RELEASE_API = "https://api.github.com/repos/FreeSize83/tts-studio/releases/latest"
 RELEASE_ASSET = "TTS-Studio.exe"
 FROZEN = getattr(sys, "frozen", False)
@@ -318,15 +318,33 @@ def _soft_limit(y, ceil_lin, fs):
     g = np.convolve(np.pad(mn, pad, mode="edge"), np.ones(L) / L, mode="valid")
     return y * np.minimum(g, need)[:, None], True
 
-def normalize_mp3(src, dst, target=-16.0, ceiling=PEAK_CEILING, bitrate=192):
+GROUPS = (("quiet", "Тихие"), ("medium", "Средние"), ("loud", "Громкие"))
+
+def norm_settings(cfg):
+    """Настройки громкости из config.json с безопасными значениями по умолчанию."""
+    saved = cfg.get("norm_groups") if isinstance(cfg.get("norm_groups"), dict) else {}; groups = {}
+    for key, title in GROUPS:
+        g = saved.get(key) if isinstance(saved.get(key), dict) else {}
+        target = g.get("target"); groups[key] = {"name": sanitize_filename(str(g.get("name") or "")) or title, "target": float(target) if isinstance(target, (int, float)) else None}
+    num = lambda k, d: float(cfg[k]) if isinstance(cfg.get(k), (int, float)) else d
+    return {"sort": bool(cfg.get("norm_sort", False)), "quiet": num("norm_quiet", -24.0), "loud": num("norm_loud", -16.0), "groups": groups,
+            "max_gain": num("norm_max_gain", 20.0), "ceiling": num("norm_ceiling", PEAK_CEILING)}
+
+def loudness_group(lufs, quiet, loud): return "quiet" if lufs < quiet else "loud" if lufs > loud else "medium"
+
+def measure_lufs(src):
+    d = miniaudio.decode(Path(src).read_bytes(), output_format=miniaudio.SampleFormat.FLOAT32)
+    return integrated_lufs(np.frombuffer(d.samples, dtype=np.float32).astype(np.float64).reshape(-1, d.nchannels), d.sample_rate)
+
+def normalize_mp3(src, dst, target=-16.0, ceiling=PEAK_CEILING, bitrate=192, max_gain=20.0):
     """Декодирует MP3, приводит к целевой громкости (LUFS) с мягким лимитером на потолке пика и кодирует обратно в MP3."""
     d = miniaudio.decode(Path(src).read_bytes(), output_format=miniaudio.SampleFormat.FLOAT32)
     ch, fs = d.nchannels, d.sample_rate; x = np.frombuffer(d.samples, dtype=np.float32).astype(np.float64).reshape(-1, ch)
-    before = integrated_lufs(x, fs); ceil_lin = 10 ** (ceiling / 20); gain = 0.0 if before <= -70 else min(target - before, 20.0)
+    before = integrated_lufs(x, fs); ceil_lin = 10 ** (ceiling / 20); gain = 0.0 if before <= -70 else min(target - before, max_gain)
     y, limited = _soft_limit(x * 10 ** (gain / 20), ceil_lin, fs); after = integrated_lufs(y, fs)
     for _ in range(3):  # лимитер слегка снижает громкость — догоняем цель
-        if before <= -70 or abs(after - target) < 0.15 or gain >= 20: break
-        gain = min(gain + target - after, 20.0); y, limited = _soft_limit(x * 10 ** (gain / 20), ceil_lin, fs); after = integrated_lufs(y, fs)
+        if before <= -70 or abs(after - target) < 0.15 or gain >= max_gain: break
+        gain = min(gain + target - after, max_gain); y, limited = _soft_limit(x * 10 ** (gain / 20), ceil_lin, fs); after = integrated_lufs(y, fs)
     pcm = (np.clip(y, -1, 1) * 32767).round().astype("<i2").tobytes()
     enc = lameenc.Encoder(); enc.set_bit_rate(bitrate); enc.set_in_sample_rate(fs); enc.set_channels(ch); enc.set_quality(2)
     data = enc.encode(pcm) + enc.flush(); dst = Path(dst); tmp = dst.with_name(dst.name + ".part")
@@ -774,6 +792,7 @@ class TakeCard(QFrame):
         path = self.take.get("exported_path", ""); ok = Path(path).is_file()
         lufs = self.take.get("export_lufs")
         self.lbl_saved.setText(f"✓ Сохранено как: {self.take.get('exported_name', '')}" + (f"   ·   {lufs:.1f} LUFS" if lufs is not None else "")
+                               + (f"   ·   папка «{self.take['export_group']}»" if self.take.get("export_group") else "")
                                + ("" if ok else "   (файл в папке проекта не найден)"))
         self.lbl_saved.setToolTip(path); self.lbl_saved.show()
         self.b_drag.path = path if ok else None; self.b_drag.setEnabled(ok)
@@ -957,12 +976,12 @@ class VoicePickerDialog(QDialog):
 
 # ---------------------------------------------------------------- настройки
 class SettingsDialog(QDialog):
-    PAGES = ("Оформление", "Папки", "Ключ и звук", "О программе")
+    PAGES = ("Оформление", "Папки", "Ключ", "Громкость", "О программе")
     def __init__(self, owner):
         super().__init__(owner); self.owner = owner; self.setWindowTitle("Настройки"); self.resize(860, 620); self.setObjectName("settings")
         self.nav = QListWidget(); self.nav.setObjectName("nav"); self.nav.setFixedWidth(190); self.stack = QStackedWidget()
         modern = UI_MODE == "modern"
-        pages = [self._page_look(), self._page_dirs(), self._page_key() if modern else None, self._page_about()]
+        pages = [self._page_look(), self._page_dirs(), self._page_key() if modern else None, self._page_norm(), self._page_about()]
         for title, pg in zip(self.PAGES, pages):
             if pg is None: continue
             self.nav.addItem(title); self.stack.addWidget(pg)
@@ -1037,15 +1056,46 @@ class SettingsDialog(QDialog):
     def refresh_dirs(self):
         for ed, get in self.dir_eds.values(): ed.setText(str(get()))
 
-    # --- Ключ и звук (в классическом интерфейсе эти поля на главном экране)
+    # --- Ключ (в классическом интерфейсе поле на главном экране)
     def _page_key(self):
         o = self.owner; w = QWidget()
         w.setLayout(vbox(self._head("API-ключ OpenRouter", "Хранится только на этом компьютере. Отправляется только в OpenRouter."),
-                         hbox((o.ed_key, 1), o.btn_eye, mkbtn("Получить ключ", lambda: QDesktopServices.openUrl(QUrl("https://openrouter.ai/keys")))), label("", "hint"),
-                         self._head("Громкость при сохранении", "Программа измеряет громкость каждого файла и приводит её к выбранному уровню: тихие файлы становятся громче, громкие тише. "
-                                    "Так все реплики проекта звучат одинаково. Оригинал в кэше не меняется."),
-                         hbox(o.chk_norm, (o.cb_norm, 1)), 1, s=8))
+                         hbox((o.ed_key, 1), o.btn_eye, mkbtn("Получить ключ", lambda: QDesktopServices.openUrl(QUrl("https://openrouter.ai/keys")))), 1, s=8))
         return w
+
+    # --- Громкость
+    def _spin(self, lo, hi, val, suffix, on_change):
+        sp = QDoubleSpinBox(); sp.setRange(lo, hi); sp.setDecimals(0); sp.setSingleStep(1); sp.setValue(val); sp.setSuffix(suffix); sp.setFixedWidth(120); sp.valueChanged.connect(on_change); return sp
+    def _page_norm(self):
+        o = self.owner; n = norm_settings(o.cfg); w = QWidget()
+        common = hbox(o.chk_norm, (o.cb_norm, 1)) if UI_MODE == "modern" else label("Включается и выбирается общий уровень на главном экране, в блоке «Доступ и проект».", "pagesub", wrap=True)
+        self.sp_gain = self._spin(0, 40, n["max_gain"], " дБ", lambda v: self._store(norm_max_gain=v))
+        self.sp_ceil = self._spin(-6, 0, n["ceiling"], " дБ", lambda v: self._store(norm_ceiling=v))
+        self.chk_sort = QCheckBox("Раскладывать озвучку по папкам: тихие, средние, громкие"); self.chk_sort.setChecked(n["sort"]); self.chk_sort.setEnabled(AUDIO_OK)
+        self.sp_quiet = self._spin(-60, -5, n["quiet"], " LUFS", lambda _v: self._thresholds())
+        self.sp_loud = self._spin(-60, -5, n["loud"], " LUFS", lambda _v: self._thresholds())
+        grid = QGridLayout(); grid.setSpacing(6); self.group_rows = {}
+        for col, text in enumerate(("Группа", "Папка внутри папки озвучки", "Уровень для группы")): grid.addWidget(label(text, "rowhead"), 0, col)
+        for row, (key, title) in enumerate(GROUPS, 1):
+            ed = QLineEdit(n["groups"][key]["name"]); ed.setPlaceholderText(title); ed.editingFinished.connect(self._store_groups)
+            cb = QComboBox(); cb.addItem("Как общий уровень", None)
+            for text, val in LOUDNESS_TARGETS: cb.addItem(text, val)
+            cb.setCurrentIndex(max(0, cb.findData(n["groups"][key]["target"]))); cb.currentIndexChanged.connect(lambda _i: self._store_groups())
+            grid.addWidget(label(title), row, 0); grid.addWidget(ed, row, 1); grid.addWidget(cb, row, 2); self.group_rows[key] = (ed, cb)
+        grid.setColumnStretch(1, 1); grid.setColumnStretch(2, 1)
+        self.sort_box = QWidget(); self.sort_box.setLayout(vbox(hbox(label("Тихие: тише"), self.sp_quiet, label("   Громкие: громче"), self.sp_loud, 1),
+                                                                label("Группа определяется по исходной громкости дубля, до нормализации.", "pagesub", wrap=True), grid, s=8))
+        self.sort_box.setEnabled(n["sort"] and AUDIO_OK); self.chk_sort.toggled.connect(self._sort_toggled); self._limit_thresholds()
+        w.setLayout(vbox(self._head("Нормализация при сохранении", "Выравнивает среднюю громкость каждого файла. Оригинал в кэше не меняется."), common,
+                         hbox(label("Максимальное усиление"), self.sp_gain, label("   Потолок пиков"), self.sp_ceil, 1), label("", "hint"),
+                         self._head("Папки по громкости", "Разные группы могут получать свой уровень. Например, шёпот можно оставить тише крика."), self.chk_sort, self.sort_box, 1, s=8))
+        return w
+    def _store(self, **kw): self.owner.cfg.update(kw); self.owner.save_cfg()
+    def _sort_toggled(self, on): self.sort_box.setEnabled(on); self._store(norm_sort=on)
+    def _limit_thresholds(self): self.sp_quiet.setMaximum(self.sp_loud.value()); self.sp_loud.setMinimum(self.sp_quiet.value())
+    def _thresholds(self): self._limit_thresholds(); self._store(norm_quiet=self.sp_quiet.value(), norm_loud=self.sp_loud.value())
+    def _store_groups(self):
+        self._store(norm_groups={k: {"name": ed.text().strip(), "target": cb.currentData()} for k, (ed, cb) in self.group_rows.items()})
 
     # --- О программе
     def _page_about(self):
@@ -1111,7 +1161,7 @@ class MainWindow(QMainWindow):
                            label(f"v{APP_VERSION}", "logosub"), self.btn_update, mkbtn("⚙  Настройки", lambda: self.settings.show_animated(), "Темы, папки, анимации, API-ключ"), m=0, s=10))
         top.layout().setContentsMargins(16, 8, 16, 8)
         self.banner = QFrame(); self.banner.setObjectName("banner")
-        self.banner.setLayout(hbox((label("Добавьте API-ключ OpenRouter, чтобы начать озвучивать", wrap=True), 1), mkbtn("Добавить ключ", lambda: self.settings.open_page("Ключ и звук"), obj="pickbtn"), m=10, s=10))
+        self.banner.setLayout(hbox((label("Добавьте API-ключ OpenRouter, чтобы начать озвучивать", wrap=True), 1), mkbtn("Добавить ключ", lambda: self.settings.open_page("Ключ"), obj="pickbtn"), m=10, s=10))
         self._make_access(); self.ed_key.editingFinished.connect(self.refresh_key_banner)
         inner = QWidget(); L = QVBoxLayout(inner); L.setContentsMargins(0, 0, 6, 0); L.setSpacing(10)
         L.setSpacing(8); L.addWidget(self.banner); L.addWidget(self._sec_voice())
@@ -1580,7 +1630,7 @@ class MainWindow(QMainWindow):
                     lambda _p, note: self._on_take_ready(meta, note), self._on_gen_fail)
 
     def _need_key(self, msg):
-        if UI_MODE == "modern" and not self.settings.isVisible() and QApplication.activeWindow() is self: self.settings.open_page("Ключ и звук"); self.ed_key.setFocus(); return
+        if UI_MODE == "modern" and not self.settings.isVisible() and QApplication.activeWindow() is self: self.settings.open_page("Ключ"); self.ed_key.setFocus(); return
         self.ed_key.setFocus(); QMessageBox.warning(QApplication.activeWindow() or self, "Нет API-ключа", msg)
 
     def refresh_key_banner(self):
@@ -1707,19 +1757,28 @@ class MainWindow(QMainWindow):
         src = CACHE_DIR / card.take["file"]
         if not src.is_file(): return QMessageBox.critical(self, "Ошибка", "Файл дубля пропал из кэша.")
         name = sanitize_filename(card.ed_name.text()) or auto_name(card.take.get("text", "")); card.ed_name.setText(name)
-        dst = unique_path(Path(folder), name); norm, note = None, ""
-        if self.chk_norm.isChecked() and AUDIO_OK:
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            try: norm = normalize_mp3(src, dst, self.cb_norm.currentData())
-            except Exception as e: note = f"   ⚠ нормализация не удалась ({type(e).__name__}: {e}) — сохранён оригинал"
-            finally: QApplication.restoreOverrideCursor()
+        ns = norm_settings(self.cfg); target, dest, group, note, norm = self.cb_norm.currentData(), Path(folder), "", "", None
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            if ns["sort"] and AUDIO_OK:
+                try:
+                    lufs = measure_lufs(src); g = ns["groups"][loudness_group(lufs, ns["quiet"], ns["loud"])]
+                    (dest / g["name"]).mkdir(parents=True, exist_ok=True); dest, group = dest / g["name"], g["name"]
+                    if g["target"] is not None: target = g["target"]
+                    note = f"   ·   исходно {lufs:.1f} LUFS → папка «{group}»"
+                except Exception as e: note = f"   ⚠ не удалось определить группу ({type(e).__name__}: {e}) — файл в основной папке"
+            dst = unique_path(dest, name)
+            if self.chk_norm.isChecked() and AUDIO_OK:
+                try: norm = normalize_mp3(src, dst, target, ns["ceiling"], max_gain=ns["max_gain"])
+                except Exception as e: note += f"   ⚠ нормализация не удалась ({type(e).__name__}: {e}) — сохранён оригинал"
+        finally: QApplication.restoreOverrideCursor()
         if norm is None:
             try: shutil.copy2(src, dst)
             except OSError as e: return QMessageBox.critical(self, "Ошибка сохранения", f"Не удалось скопировать файл:\n{e}")
         card.take.update(saved=True, exported_name=dst.name, exported_path=str(dst),
-                         export_lufs=round(norm["after"], 1) if norm else None)
+                         export_lufs=round(norm["after"], 1) if norm else None, export_group=group)
         self.save_index(); card.mark_saved()
-        if norm: note = f"   ·   громкость {norm['before']:.1f} → {norm['after']:.1f} LUFS" + ("  (лимитер пиков)" if norm["limited"] else "")
+        if norm: note += f"   ·   громкость {norm['before']:.1f} → {norm['after']:.1f} LUFS" + ("  (лимитер пиков)" if norm["limited"] else "")
         self.status(f"✓ Сохранено: {dst}" + ("   (имя занято — добавлен суффикс версии)" if dst.stem != name else "") + note, 15000)
 
     def delete_take(self, card):
@@ -1923,7 +1982,7 @@ def apply_theme(app, name=None):
         pal.setColor(QPalette.ColorGroup.Disabled, role, QColor(t["faint"]))
     r = int(t["r"]); app.setPalette(pal)
     v = {k: x for k, x in t.items() if k != "r"}; light = is_light(t["bg"]); a = 225 if light else 205  # полупрозрачные панели поверх анимированного фона
-    qss = QSS.substitute(v, r=r, r2=r + 3, rp=max(r + 4, 12)) + COMMON_QSS.substitute(v)
+    qss = QSS.substitute(v, r=r, r2=r + 3, rp=max(r + 4, 12)) + COMMON_QSS.substitute(v, r=r)
     if UI_MODE == "modern":
         qss += MODERN_QSS.substitute(v, panel_a=_rgba(t["panel"], a), card_a=_rgba(t["card"], a + 15), input_a=_rgba(t["input"], a + 15), raised_a=_rgba(t["raised"], a), border_a=_rgba(t["border_hi"], 130)) + combo_arrow_qss(t["dim"])
     app.setStyleSheet(qss)
