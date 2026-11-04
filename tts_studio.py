@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """TTS Studio — генерация озвучки через OpenRouter Audio Speech API (ElevenLabs v4 / v4-turbo)."""
-import hashlib, html, json, os, random, re, shutil, struct, subprocess, sys, tempfile, time, traceback, uuid
+import base64, hashlib, html, json, os, random, re, shutil, struct, subprocess, sys, tempfile, time, traceback, uuid
 from pathlib import Path
 from string import Template
 import math
@@ -26,7 +26,7 @@ try:  # нормализация громкости (numpy + miniaudio для д
 except Exception as _e:
     AUDIO_OK, AUDIO_ERR = False, f"{type(_e).__name__}: {_e}"
 
-APP_VERSION = "1.2.0"  # должна совпадать с git-тегом релиза (v1.0.0): это проверяет сборка в GitHub Actions
+APP_VERSION = "1.3.0"  # должна совпадать с git-тегом релиза (v1.0.0): это проверяет сборка в GitHub Actions
 RELEASE_API = "https://api.github.com/repos/FreeSize83/tts-studio/releases/latest"
 RELEASE_ASSET = "TTS-Studio.exe"
 FROZEN = getattr(sys, "frozen", False)
@@ -60,10 +60,11 @@ def move_files(src, dst, patterns):
             except OSError as e: errors.append(f"{f.name}: {e}")
     return errors
 
-CACHE_PATTERNS, PREVIEW_PATTERNS = ("take_*.mp3", "takes_index.json"), ("en_*.mp3", "ru_*.mp3")
+CACHE_PATTERNS, PREVIEW_PATTERNS, FREE_PATTERNS = ("take_*.mp3", "takes_index.json"), ("en_*.mp3", "ru_*.mp3"), ("free_*.mp3", "free_index.json")
 CONFIG_PATH = home_dir() / "config.json"
 PREVIEW_DIR = home_dir() / "voice_previews"
 CACHE_DIR = home_dir() / "cache_takes"
+FREE_DIR = home_dir() / "free_takes"  # бесплатная генерация хранится отдельно от платной
 INDEX_PATH = CACHE_DIR / "takes_index.json"
 PLAYBACK_FILES = (CACHE_DIR / "_active_playback.mp3", CACHE_DIR / "_active_playback_alt.mp3")
 
@@ -85,8 +86,9 @@ def init_config_path(app_dir=None):
     except OSError:
         if legacy.is_file(): CONFIG_PATH = legacy
 
-def set_dirs(cache=None, previews=None):
-    global CACHE_DIR, PREVIEW_DIR, INDEX_PATH, PLAYBACK_FILES
+def set_dirs(cache=None, previews=None, free=None):
+    global CACHE_DIR, PREVIEW_DIR, FREE_DIR, INDEX_PATH, PLAYBACK_FILES
+    if free: FREE_DIR = Path(free)
     if cache:
         CACHE_DIR = Path(cache); INDEX_PATH = CACHE_DIR / "takes_index.json"
         PLAYBACK_FILES = (CACHE_DIR / "_active_playback.mp3", CACHE_DIR / "_active_playback_alt.mp3")
@@ -95,7 +97,7 @@ def set_dirs(cache=None, previews=None):
 def resolve_dirs(cfg, app_dir=None):
     """Папка из настроек → старая папка рядом с программой → служебная. Недоступная (например, отключённый диск) пропускается."""
     app_dir = Path(app_dir or APP_DIR); desktop = app_on_desktop(app_dir); out, warn = [], []
-    for key, name in (("cache_dir", "cache_takes"), ("preview_dir", "voice_previews")):
+    for key, name in (("cache_dir", "cache_takes"), ("preview_dir", "voice_previews"), ("free_dir", "free_takes")):
         cands = [cfg.get(key), None if desktop or not (app_dir / name).is_dir() else app_dir / name, home_dir() / name]
         for i, c in enumerate(cands):
             if not c: continue
@@ -103,7 +105,7 @@ def resolve_dirs(cfg, app_dir=None):
             except OSError:
                 if i == 0: warn.append(str(c))
         else: out.append(home_dir() / name)
-    set_dirs(out[0], out[1]); return warn
+    set_dirs(out[0], out[1], out[2]); return warn
 
 UI_SCALE = 1.0  # итоговый масштаб интерфейса этого запуска
 SCALE_CHOICES = (("Авто (под монитор)", "auto"), ("80%", .8), ("90%", .9), ("100%", 1.0), ("110%", 1.1), ("125%", 1.25), ("150%", 1.5))
@@ -762,7 +764,7 @@ class AudioPlayer(QFrame):
 class TakeCard(QFrame):
     play = pyqtSignal(object); load = pyqtSignal(object); save = pyqtSignal(object); delete = pyqtSignal(object)
     def __init__(self, take):
-        super().__init__(); self.take = take; self.setObjectName("card"); p = take.get("params", {})
+        super().__init__(); self.take = take; self.setObjectName("card"); p = {} if take.get("free") else take.get("params", {})
         ts = time.strftime("%d.%m.%Y  %H:%M:%S", time.localtime(take.get("created", 0)))
         char = take.get("character") or ""
         head = hbox(label(f"<b>{ts}</b>"), label(esc(take.get("model", "")), "chip"), label(f"🎤 {esc(take.get('voice', ''))}", "chip" if char else "chipacc"),
@@ -770,6 +772,7 @@ class TakeCard(QFrame):
         meta = f"Stab {p.get('stability', 0):.2f} · Sim {p.get('similarity', 0):.2f} · Style {p.get('style', 0):.2f} · " \
                f"Speed {p.get('speed', 1):.2f} · Seed {p.get('seed') or '—'} · Lang {p.get('language', '—')}"
         if not take.get("model", "").startswith("elevenlabs/") or not p.get("extended", True): meta += " · базовые параметры"
+        if take.get("free"): meta = take.get("meta", "")
         if p.get("fallback"): meta += " · ⚠ без расширенных (fallback)"
         text = take.get("text", "")
         txt = ClickLabel(text if len(text) <= 420 else text[:420] + "…"); txt.setObjectName("taketext")
@@ -974,6 +977,252 @@ class VoicePickerDialog(QDialog):
         v = self.manual.text().strip()
         if v: self.selected = v; self.accept()
 
+# ---------------------------------------------------------------- бесплатная генерация
+QWEN_HOST = "https://qwen-qwen3-tts.hf.space"
+CHATTERBOX_HOST = "https://resembleai-chatterbox-multilingual-tts.hf.space"
+VOXCPM_HOST = "https://openbmb-voxcpm-demo.hf.space"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
+GEMINI_MODEL = "gemini-3.8-flash-tts"
+FREE_ENGINES = (
+    ("qwen_design", "Qwen3-TTS: голос по описанию", "Qwen3-TTS", "Опишите словами голос и эмоцию. Голос может меняться от дубля к дублю. Без токена хватает на несколько реплик в день."),
+    ("qwen_speaker", "Qwen3-TTS: готовые голоса", "Qwen3-TTS", "Постоянный голос и указание, как произносить текст. Без токена хватает на несколько реплик в день."),
+    ("chatterbox", "Chatterbox: сила эмоции", "Chatterbox", "Ползунок силы эмоции и повторяемый результат через seed. До 300 символов за раз. Без токена хватает на несколько реплик в день."),
+    ("voxcpm", "VoxCPM2: голос по описанию", "VoxCPM2", "Опишите голос и подачу словами. Язык определяется по тексту. Работает без дневной квоты на видеокарту."),
+    ("gemini", "Gemini TTS: нужен бесплатный ключ Google", "Gemini TTS", "Стиль словами и теги вроде <laugh> прямо в тексте. Google не обслуживает этот API в России и Беларуси."))
+FREE_LANGS = (("Русский", "ru", "Russian"), ("English", "en", "English"), ("Deutsch", "de", "German"), ("Français", "fr", "French"), ("Español", "es", "Spanish"), ("Português", "pt", "Portuguese"))
+QWEN_SPEAKERS = ("Serena", "Vivian", "Sohee", "Ono_anna", "Ryan", "Aiden", "Dylan", "Eric", "Uncle_fu")
+GEMINI_VOICES = ("Kore", "Puck", "Charon", "Zephyr", "Fenrir", "Leda", "Orus", "Aoede", "Callirrhoe", "Enceladus", "Sulafat", "Gacrux")
+GEMINI_TAGS = ("<laugh>", "<sigh>", "<gasp>", "<whispering>", "<cry>", "<short pause>")
+# название, описание для движков с текстовым описанием, указание для готовых голосов, сила эмоции Chatterbox
+FREE_EMOTIONS = (("Спокойно", "Спокойный ровный голос, говорит неторопливо и мягко", "Calm, soft and unhurried", .35),
+                 ("Радость", "Радостный живой голос, говорит с улыбкой и воодушевлением", "Joyful and excited, smiling", .9),
+                 ("Грусть", "Грустный голос, говорит тихо и медленно, с печалью", "Sad, quiet and slow", .4),
+                 ("Гнев", "Разгневанный резкий голос, говорит напористо и громко", "Angry, sharp and loud", 1.3),
+                 ("Страх", "Испуганный голос, говорит напряжённо и быстро, со страхом", "Scared, tense and fast", 1.0),
+                 ("Шёпот", "Говорит тихим напряжённым шёпотом", "Urgent quiet whisper", .35),
+                 ("Драма", "Театральная подача, выразительно, с большими паузами", "Theatrical and dramatic, with long pauses", 1.6))
+
+def free_error_text(raw):
+    t = str(raw or "").strip().strip('"')
+    if not t or t == "null": return "Сервис вернул ошибку без описания. Скорее всего, закончилась бесплатная дневная квота или он занят. Попробуйте VoxCPM2, добавьте токен Hugging Face или повторите позже."
+    if "quota" in t.lower(): return "Закончилась бесплатная дневная квота этого сервиса. Выберите другой движок, повторите позже или добавьте токен Hugging Face.\n\n" + t[:300]
+    return t[:600]
+
+def gradio_call(host, endpoint, data, token=""):
+    """Вызов публичного демо Hugging Face по HTTP-API Gradio: запрос, затем ожидание результата в потоке событий."""
+    h = {"Authorization": f"Bearer {token}"} if token else {}
+    r = requests.post(f"{host}/gradio_api/call/{endpoint}", json={"data": data}, headers=h, timeout=(15, 60))
+    if r.status_code != 200: raise RuntimeError(f"Сервис недоступен: HTTP {r.status_code}. Попробуйте другой движок.")
+    kind = None
+    with requests.get(f"{host}/gradio_api/call/{endpoint}/{r.json()['event_id']}", stream=True, headers=h, timeout=(15, 300)) as ev:
+        ev.encoding = "utf-8"
+        for line in ev.iter_lines(decode_unicode=True):
+            if line.startswith("event:"): kind = line[6:].strip()
+            elif line.startswith("data:") and kind == "error": raise RuntimeError(free_error_text(line[5:]))
+            elif line.startswith("data:") and kind == "complete": return json.loads(line[5:].strip())
+    raise RuntimeError("Сервис закрыл соединение, не вернув результат. Попробуйте ещё раз.")
+
+def gradio_audio(result, token=""):
+    url = next((x.get("url") for x in result if isinstance(x, dict) and x.get("url")), None)
+    if not url: raise RuntimeError("Сервис не вернул аудио.")
+    a = requests.get(url, headers={"Authorization": f"Bearer {token}"} if token else {}, timeout=(15, 120)); a.raise_for_status(); return a.content
+
+def gemini_audio(p):
+    body = {"model": GEMINI_MODEL, "input": [{"type": "user_input", "content": [{"type": "text", "text": p["text"], "annotations": [{"type": "speech_metadata", "style": p["style"]}] if p["style"] else []}]}],
+            "response_format": {"type": "audio"}, "generation_config": {"speech_config": [{"voice": p["voice"]}]}}
+    r = requests.post(GEMINI_URL, json=body, headers={"x-goog-api-key": p["gemini_key"]}, timeout=(15, 180))
+    if r.status_code == 429: raise RuntimeError("Закончился бесплатный лимит Gemini. Повторите позже или выберите другой движок.")
+    if r.status_code != 200:
+        try: msg = r.json().get("error", {}).get("message", "")
+        except Exception: msg = r.text
+        raise RuntimeError(f"Gemini: HTTP {r.status_code}. {msg[:400]}")
+    audio = [c.get("data") for st in r.json().get("steps") or [] if st.get("type") == "model_output" for c in st.get("content") or [] if c.get("type") == "audio" and c.get("data")]
+    if not audio: raise RuntimeError("Gemini не вернул аудио.")
+    return base64.b64decode(audio[-1])
+
+def audio_bytes_to_mp3(data, dst, bitrate=192):
+    d = miniaudio.decode(data, output_format=miniaudio.SampleFormat.SIGNED16)
+    enc = lameenc.Encoder(); enc.set_bit_rate(bitrate); enc.set_in_sample_rate(d.sample_rate); enc.set_channels(d.nchannels); enc.set_quality(2)
+    dst = Path(dst); tmp = dst.with_name(dst.name + ".part"); tmp.write_bytes(enc.encode(d.samples.tobytes()) + enc.flush()); os.replace(tmp, dst)
+
+class FreeTTSWorker(QThread):
+    ok = pyqtSignal(str); fail = pyqtSignal(str)
+    def __init__(self, params, out): super().__init__(); self.p, self.out = params, Path(out)
+    def run(self):
+        p = self.p; tok = p.get("hf_token", ""); e = p["engine"]
+        try:
+            if e == "qwen_design": data = gradio_audio(gradio_call(QWEN_HOST, "generate_voice_design", [p["text"], p["lang_name"], p["desc"]], tok), tok)
+            elif e == "qwen_speaker": data = gradio_audio(gradio_call(QWEN_HOST, "generate_custom_voice", [p["text"], p["lang_name"], p["speaker"], p["instruct"], "1.7B"], tok), tok)
+            elif e == "chatterbox":
+                ref = gradio_call(CHATTERBOX_HOST, "on_language_change", [p["lang"], None, ""], tok)[0]  # встроенный образец голоса для языка
+                data = gradio_audio(gradio_call(CHATTERBOX_HOST, "generate_tts_audio", [p["text"], p["lang"], ref, p["exaggeration"], p["temperature"], p["seed"], p["cfg"]], tok), tok)
+            elif e == "voxcpm": data = gradio_audio(gradio_call(VOXCPM_HOST, "generate", [p["text"], p["control"], None, False, "", p["vox_cfg"], False, False], tok), tok)
+            else: data = gemini_audio(p)
+            audio_bytes_to_mp3(data, self.out); self.ok.emit(str(self.out))
+        except requests.exceptions.RequestException as ex: self.fail.emit(f"Нет связи с сервисом: {type(ex).__name__}. Проверьте интернет или выберите другой движок.")
+        except Exception as ex: self.fail.emit(str(ex) or type(ex).__name__)
+
+class FreeTab(QWidget):
+    """Отдельная вкладка: свой текст, плеер, лента и папка. С платной генерацией не пересекается: ключ OpenRouter здесь не используется."""
+    GEN_TEXT = "СГЕНЕРИРОВАТЬ БЕСПЛАТНО  (Ctrl + Enter)"
+    def __init__(self, owner):
+        super().__init__(); self.owner = owner; self.busy = False; self.started = 0.0; self.cards = {}; c = owner.cfg.get("free") if isinstance(owner.cfg.get("free"), dict) else {}
+        self.takes = [t for t in load_json(FREE_DIR / "free_index.json", []) if isinstance(t, dict) and t.get("file")]
+        self.timer = QTimer(self); self.timer.setInterval(500); self.timer.timeout.connect(self._tick)
+        modern = UI_MODE == "modern"
+        # --- движок
+        g_eng = QGroupBox("Бесплатный движок"); self.cb_engine = QComboBox()
+        for key, title, _short, _d in FREE_ENGINES: self.cb_engine.addItem(title, key)
+        self.lbl_desc = label("", "pagesub", wrap=True); self.panels = QStackedWidget(); self.fields = {}
+        self.cb_lang = QComboBox()
+        for name, code, full in FREE_LANGS: self.cb_lang.addItem(name, code)
+        self.cb_lang.setCurrentIndex(max(0, self.cb_lang.findData(c.get("lang", "ru"))))
+        self.row_lang = QWidget(); self.row_lang.setLayout(hbox(label("Язык:"), (self.cb_lang, 1)))
+        self._build_panels(c)
+        chips = QGridLayout(); chips.setSpacing(4)
+        for i, em in enumerate(FREE_EMOTIONS):
+            chips.addWidget(mkbtn(em[0], lambda e=em: self._emotion(e), "Подставить эту эмоцию в настройки движка", "tag"), 0, i)
+        self.ed_token = QLineEdit(c.get("hf_token", "")); self.ed_token.setEchoMode(QLineEdit.EchoMode.Password); self.ed_token.setPlaceholderText("необязательно: дневная квота 5 минут вместо 2")
+        self.row_token = QWidget(); self.row_token.setLayout(hbox(label("Токен Hugging Face:"), (self.ed_token, 1), mkbtn("Получить", lambda: QDesktopServices.openUrl(QUrl("https://huggingface.co/settings/tokens")))))
+        self.ed_gkey = QLineEdit(c.get("gemini_key", "")); self.ed_gkey.setEchoMode(QLineEdit.EchoMode.Password); self.ed_gkey.setPlaceholderText("ключ из Google AI Studio")
+        self.row_gkey = QWidget(); self.row_gkey.setLayout(hbox(label("Ключ Google:"), (self.ed_gkey, 1), mkbtn("Получить", lambda: QDesktopServices.openUrl(QUrl("https://aistudio.google.com/apikey")))))
+        v = QVBoxLayout(g_eng); v.addWidget(self.cb_engine); v.addWidget(self.lbl_desc); v.addWidget(self.row_lang); v.addWidget(self.panels); v.addLayout(chips); v.addWidget(self.row_token); v.addWidget(self.row_gkey)
+        v.addWidget(label("Текст уходит на публичный сервис выбранной модели. Такие сервисы бывают заняты, имеют дневные лимиты и могут измениться без предупреждения.", "pagesub", wrap=True))
+        # --- текст
+        g_txt = QGroupBox("Текст для бесплатной озвучки"); tv = QVBoxLayout(g_txt)
+        self.tag_row = QWidget(); self.tag_row.setLayout(hbox(*[mkbtn(t, lambda t=t: self._insert_tag(t), "Вставить тег", "tag") for t in GEMINI_TAGS], 1, s=4)); tv.addWidget(self.tag_row)
+        self.txt = TextEdit(); self.txt.setMinimumHeight(120); self.txt.setPlaceholderText("Введите текст…"); self.txt.setPlainText(c.get("text", "")); self.txt.submit.connect(self.generate); self.txt.textChanged.connect(self._count)
+        self.lbl_count = label("", "cost"); tv.addWidget(self.txt, 1); tv.addWidget(self.lbl_count)
+        self.btn_gen = mkbtn(self.GEN_TEXT, self.generate, obj="gen")
+        inner = QWidget(); L = QVBoxLayout(inner); L.setContentsMargins(0, 0, 6, 0); L.setSpacing(8); L.addWidget(g_eng); L.addWidget(g_txt, 1)
+        left = QScrollArea(); left.setWidgetResizable(True); left.setWidget(inner); left.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        col = QWidget(); col.setMinimumWidth(440); col.setLayout(vbox((left, 1), self.btn_gen, s=8)); col.layout().setContentsMargins(10, 8, 4, 8)
+        # --- плеер и лента
+        self.player = AudioPlayer(owner.status); self.player.autoplay.setChecked(c.get("autoplay", True))
+        self.list_w = QWidget(); self.list_l = QVBoxLayout(self.list_w); self.list_l.setContentsMargins(0, 0, 4, 0); self.list_l.setSpacing(8); self.list_l.addStretch(1)
+        self.empty = label("Здесь появятся бесплатные дубли.\nОни хранятся отдельно от платных.", "emptylbl"); self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter); self.list_l.insertWidget(0, self.empty)
+        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True); self.scroll.setWidget(self.list_w)
+        right = QWidget(); right.setLayout(vbox(self.player, hbox(label("Бесплатные дубли", "section"), label("новые сверху, хранятся 7 дней", "meta"), 1), (self.scroll, 1), s=8)); right.layout().setContentsMargins(4, 8, 10, 8)
+        self.split = QSplitter(Qt.Orientation.Horizontal); self.split.setChildrenCollapsible(False); self.split.addWidget(col); self.split.addWidget(right)
+        if modern: self.split.setObjectName("modern"); left.setObjectName("clear"); self.scroll.setObjectName("clear")
+        self.setLayout(vbox((self.split, 1)))
+        self.cb_engine.currentIndexChanged.connect(self._engine_changed); self.cb_engine.setCurrentIndex(max(0, self.cb_engine.findData(c.get("engine", "voxcpm")))); self._engine_changed()
+        self._cleanup()
+        for t in sorted(self.takes, key=lambda t: t.get("created", 0)): self._add_card(t)
+        self.empty.setVisible(not self.takes)
+
+    def _build_panels(self, c):
+        o, f = self.owner, self.fields
+        def line(key, ph, default=""):
+            e = QLineEdit(str(c.get(key, default))); e.setPlaceholderText(ph); f[key] = e; return e
+        def combo(key, items, default):
+            b = QComboBox(); b.addItems(items); b.setCurrentText(str(c.get(key, default))); f[key] = b; return b
+        def page(*rows):
+            w = QWidget(); w.setLayout(vbox(*rows, s=6)); w.layout().setContentsMargins(0, 0, 0, 0); return w
+        for key in ("qwen_design",):
+            self.panels.addWidget(page(hbox(label("Голос и эмоция:"), (line("desc", "например: испуганная молодая женщина говорит шёпотом", FREE_EMOTIONS[0][1]), 1))))
+        self.panels.addWidget(page(hbox(label("Голос:"), (combo("speaker", QWEN_SPEAKERS, "Serena"), 1)), hbox(label("Как говорить:"), (line("instruct", "английскими словами: scared, urgent whisper", FREE_EMOTIONS[0][2]), 1))))
+        grid = QGridLayout(); grid.setContentsMargins(0, 0, 0, 0)
+        f["exaggeration"] = o._slider(grid, 0, "Сила эмоции", .25, 2.0, float(c.get("exaggeration", .5)), "Выше: ярче и эмоциональнее")
+        f["temperature"] = o._slider(grid, 1, "Вариативность", .05, 1.5, float(c.get("temperature", .8)), "Выше: дубли сильнее отличаются друг от друга")
+        f["cfg"] = o._slider(grid, 2, "Темп и точность", .2, 1.0, float(c.get("cfg", .5)), "Ниже при сильной эмоции: речь спокойнее и медленнее")
+        f["seed"] = QLineEdit(str(c.get("seed", ""))); f["seed"].setPlaceholderText("пусто: случайно"); f["seed"].setValidator(QRegularExpressionValidator(QRegularExpression(r"\d{0,9}"), self))
+        grid.addWidget(label("Seed"), 3, 0); grid.addWidget(f["seed"], 3, 1, 1, 2); grid.setColumnStretch(1, 1); self.panels.addWidget(page(grid))
+        vg = QGridLayout(); vg.setContentsMargins(0, 0, 0, 0)
+        f["vox_cfg"] = o._slider(vg, 1, "Следование описанию", 1.0, 3.0, float(c.get("vox_cfg", 2.0)), "Выше: сильнее держится описания и текста"); vg.setColumnStretch(1, 1)
+        vg.addWidget(label("Голос и подача:"), 0, 0); vg.addWidget(line("control", "например: уставший мужской голос, говорит медленно", FREE_EMOTIONS[0][1]), 0, 1, 1, 2)
+        self.panels.addWidget(page(vg))
+        self.panels.addWidget(page(hbox(label("Голос:"), (combo("voice", GEMINI_VOICES, "Kore"), 1)), hbox(label("Стиль:"), (line("style", "например: шепчет с тревогой", FREE_EMOTIONS[0][1]), 1))))
+
+    def _engine(self): return self.cb_engine.currentData()
+    def _engine_changed(self):
+        e = self._engine(); i = self.cb_engine.currentIndex(); self.panels.setCurrentIndex(i); self.lbl_desc.setText(FREE_ENGINES[i][3])
+        self.row_lang.setVisible(e in ("qwen_design", "qwen_speaker", "chatterbox")); self.row_token.setVisible(e != "gemini"); self.row_gkey.setVisible(e == "gemini"); self.tag_row.setVisible(e == "gemini"); self._count()
+        for j in range(self.panels.count()):  # стек занимает только высоту текущей панели
+            self.panels.widget(j).setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred if j == i else QSizePolicy.Policy.Ignored)
+        self.panels.adjustSize()
+    def _emotion(self, em):
+        name, desc, en, power = em; e = self._engine(); f = self.fields
+        if e == "qwen_design": f["desc"].setText(desc)
+        elif e == "qwen_speaker": f["instruct"].setText(en)
+        elif e == "chatterbox": f["exaggeration"].setValue(round(power * 100))
+        elif e == "voxcpm": f["control"].setText(desc)
+        else: f["style"].setText(desc)
+        self.owner.status(f"Эмоция: {name}")
+    def _insert_tag(self, t): self.txt.insertPlainText(t + " "); self.txt.setFocus()
+    def _count(self):
+        n = len(self.txt.toPlainText()); limited = self._engine() == "chatterbox"
+        self.lbl_count.setText(f"Символов: <b>{n}</b>" + (" из 300" if limited else "") + " &nbsp;·&nbsp; <b>Бесплатно</b>")
+
+    def state(self):
+        f = self.fields; st = {k: f[k].text() for k in ("desc", "instruct", "seed", "control", "style")}
+        st.update(speaker=f["speaker"].currentText(), voice=f["voice"].currentText(), engine=self._engine(), lang=self.cb_lang.currentData(), text=self.txt.toPlainText(), hf_token=self.ed_token.text().strip(),
+                  gemini_key=self.ed_gkey.text().strip(), autoplay=self.player.autoplay.isChecked(), **{k: f[k].value() / 100 for k in ("exaggeration", "temperature", "cfg", "vox_cfg")})
+        return st
+    def _params(self):
+        st = self.state(); st["lang_name"] = next((full for _n, code, full in FREE_LANGS if code == st["lang"]), "Auto"); st["seed"] = int(st["seed"] or 0)
+        return st
+    def _summary(self, st):
+        e = st["engine"]
+        if e == "qwen_design": return st["desc"], "описание"
+        if e == "qwen_speaker": return st["instruct"], st["speaker"]
+        if e == "chatterbox": return f"Сила эмоции {st['exaggeration']:.2f} · вариативность {st['temperature']:.2f} · seed {st['seed'] or 'случайный'}", "встроенный голос"
+        if e == "voxcpm": return st["control"], "описание"
+        return st["style"], st["voice"]
+
+    def generate(self):
+        parent = QApplication.activeWindow() or self.owner
+        if self.busy: return
+        if not AUDIO_OK: return QMessageBox.warning(parent, "Бесплатная озвучка", f"Не загрузились звуковые библиотеки:\n{AUDIO_ERR}")
+        st = self._params(); text = st["text"] = st["text"].strip()
+        if not text: self.txt.setFocus(); return QMessageBox.warning(parent, "Нет текста", "Введите текст для озвучки.")
+        if st["engine"] == "chatterbox" and len(text) > 300: return QMessageBox.warning(parent, "Слишком длинный текст", f"Chatterbox озвучивает до 300 символов за раз, сейчас {len(text)}. Разделите текст или выберите другой движок.")
+        if st["engine"] == "gemini" and not st["gemini_key"]: self.ed_gkey.setFocus(); return QMessageBox.warning(parent, "Нет ключа", "Для Gemini нужен бесплатный ключ из Google AI Studio.")
+        if st["engine"] in ("qwen_design", "voxcpm") and not (st["desc"] if st["engine"] == "qwen_design" else st["control"]).strip(): return QMessageBox.warning(parent, "Нет описания", "Опишите голос и эмоцию.")
+        out = FREE_DIR / f"free_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.mp3"; short = next(x[2] for x in FREE_ENGINES if x[0] == st["engine"]); summary, who = self._summary(st)
+        meta = {"id": uuid.uuid4().hex, "created": time.time(), "file": out.name, "text": text, "model": short, "voice": who, "free": True, "meta": summary, "params": {k: v for k, v in st.items() if k not in ("hf_token", "gemini_key", "text")},
+                "saved": False, "exported_name": "", "exported_path": ""}
+        self.busy = True; self.started = time.time(); self.btn_gen.setEnabled(False); self.timer.start(); self._tick(); self.owner.save_cfg(); self.owner.status(f"Бесплатная генерация: {short}…", 0)
+        self.owner._start(FreeTTSWorker(st, out), lambda _p: self._ready(meta), self._failed)
+    def _tick(self): self.btn_gen.setText(f"⏳  БЕСПЛАТНАЯ ГЕНЕРАЦИЯ…  {int(time.time() - self.started)} с")
+    def _reset(self): self.busy = False; self.timer.stop(); self.btn_gen.setEnabled(True); self.btn_gen.setText(self.GEN_TEXT)
+    def _failed(self, msg): self._reset(); self.owner.status("Ошибка бесплатной генерации"); QMessageBox.critical(QApplication.activeWindow() or self.owner, "Бесплатная генерация", msg)
+    def _ready(self, meta):
+        self._reset(); self.takes.append(meta); self.save_index(); card = self._add_card(meta); self.empty.hide(); reveal(card) if UI_MODE == "modern" else None
+        self.owner.status(f"Готово за {time.time() - self.started:.1f} с, бесплатно", 15000); self.scroll.verticalScrollBar().setValue(0)
+        if self.player.autoplay.isChecked(): self._play(meta)
+    def _add_card(self, take):
+        c = TakeCard(take); c.play.connect(self._play); c.load.connect(self._load); c.save.connect(self.owner.save_take); c.delete.connect(self._delete); self.list_l.insertWidget(0, c); self.cards[take["id"]] = c; return c
+    def _play(self, t): self.player.play_file(FREE_DIR / t["file"], f"{t['model']} · {t['text'][:70]}")
+    def _load(self, t):
+        p = t.get("params", {}); self.txt.setPlainText(t.get("text", "")); self.cb_engine.setCurrentIndex(max(0, self.cb_engine.findData(p.get("engine")))); self.cb_lang.setCurrentIndex(max(0, self.cb_lang.findData(p.get("lang", "ru"))))
+        for k in ("desc", "instruct", "control", "style"): self.fields[k].setText(str(p.get(k, "")))
+        self.fields["seed"].setText(str(p.get("seed") or ""))
+        for k in ("speaker", "voice"): self.fields[k].setCurrentText(str(p.get(k, self.fields[k].currentText())))
+        for k in ("exaggeration", "temperature", "cfg", "vox_cfg"):
+            if isinstance(p.get(k), (int, float)): self.fields[k].setValue(round(p[k] * 100))
+        self.txt.setFocus(); self.owner.status("Текст и настройки дубля загружены")
+    def _delete(self, card):
+        t = card.take; extra = "\n\nСохранённая копия не удаляется." if t.get("saved") else ""
+        if QMessageBox.question(QApplication.activeWindow() or self.owner, "Удалить дубль", f"Удалить дубль?{extra}") != QMessageBox.StandardButton.Yes: return
+        try: (FREE_DIR / t["file"]).unlink(missing_ok=True)
+        except OSError as e: return QMessageBox.critical(self.owner, "Ошибка", f"Не удалось удалить файл:\n{e}")
+        if t in self.takes: self.takes.remove(t)
+        self.cards.pop(t["id"], None); card.deleteLater(); self.save_index(); self.empty.setVisible(not self.takes)
+    def _cleanup(self):
+        now, keep = time.time(), []
+        for t in self.takes:
+            f = FREE_DIR / t["file"]
+            if not f.is_file(): continue
+            if now - float(t.get("created", 0)) > MAX_AGE:
+                try: f.unlink(); continue
+                except OSError: pass
+            keep.append(t)
+        self.takes = keep; self.save_index()
+    def save_index(self):
+        try: save_json(FREE_DIR / "free_index.json", self.takes)
+        except OSError as e: self.owner.status(f"Не удалось сохранить список бесплатных дублей: {e}")
+
 # ---------------------------------------------------------------- настройки
 class SettingsDialog(QDialog):
     PAGES = ("Оформление", "Папки", "Ключ", "Громкость", "О программе")
@@ -1045,6 +1294,8 @@ class SettingsDialog(QDialog):
                                   lambda: CACHE_DIR, lambda: o.pick_dir("cache"), lambda: o.move_dir("cache", home_dir() / "cache_takes"), lambda: o.open_dir(CACHE_DIR)))
         rows.append(self._dir_row("Превью голосов", "Образцы голосов. Хранятся постоянно, чтобы не платить за повторную генерацию.",
                                   lambda: PREVIEW_DIR, lambda: o.pick_dir("preview"), lambda: o.move_dir("preview", home_dir() / "voice_previews"), lambda: o.open_dir(PREVIEW_DIR)))
+        rows.append(self._dir_row("Бесплатная озвучка", "Дубли со вкладки «Бесплатно». Хранятся отдельно от платных, старше 7 дней удаляются автоматически.",
+                                  lambda: FREE_DIR, lambda: o.pick_dir("free"), lambda: o.move_dir("free", home_dir() / "free_takes"), lambda: o.open_dir(FREE_DIR)))
         rows.append(self._dir_row("Настройки программы", "Файл config.json с настройками и API-ключом. Его расположение не меняется.",
                                   lambda: CONFIG_PATH.parent, lambda: None, lambda: None, lambda: o.open_dir(CONFIG_PATH.parent)))
         last = rows[-1]
@@ -1150,6 +1401,21 @@ class MainWindow(QMainWindow):
         for name, t in THEMES.items(): self.cb_theme.addItem(theme_icon(t), name)
         self.cb_theme.setCurrentText(CURRENT_THEME); self.cb_theme.currentTextChanged.connect(self.set_theme)
 
+    def _make_pages(self, paid):
+        """Переключатель «Платно / Бесплатно»: две независимые страницы."""
+        self.pages = QStackedWidget(); self.pages.setObjectName("pages"); self.pages.addWidget(paid); self.free = FreeTab(self); self.pages.addWidget(self.free)
+        self.btn_paid = QPushButton("Платная генерация"); self.btn_free = QPushButton("Бесплатная генерация"); grp = QButtonGroup(self)
+        for i, b in enumerate((self.btn_paid, self.btn_free)):
+            b.setObjectName("tabbtn"); b.setCheckable(True); b.setCursor(Qt.CursorShape.PointingHandCursor); grp.addButton(b); b.clicked.connect(lambda _=False, i=i: self.set_page(i))
+        start = 1 if self.cfg.get("free_tab") else 0; (self.btn_free if start else self.btn_paid).setChecked(True); self.pages.setCurrentIndex(start)
+        return hbox(self.btn_paid, self.btn_free, s=4)
+
+    def set_page(self, i):
+        if i == self.pages.currentIndex(): return
+        (self.free.player if i == 0 else self.player).stop(); self.pages.setCurrentIndex(i); fade_in(self.pages.currentWidget(), 180); self.save_cfg()
+
+    def busy(self): return self.gen_timer.isActive() or self.free.busy
+
     def _make_update_btn(self):
         self.btn_update = mkbtn(UPDATE_TEXT, self.update_app, f"Установлена версия {APP_VERSION}. Скачивает новую версию и сразу перезапускает программу — настройки и дубли сохраняются")
 
@@ -1157,7 +1423,8 @@ class MainWindow(QMainWindow):
         self._make_theme_box(); self.cb_theme.setParent(self); self.cb_theme.hide(); self._make_update_btn()
         logo = QLabel(); logo.setPixmap(QPixmap.fromImage(make_icon_image(36)))
         top = QFrame(); top.setObjectName("topbar")
-        top.setLayout(hbox(logo, vbox(label("TTS Studio", "logo"), label("Текст на входе, готовая реплика на выходе", "logosub"), s=0), 1,
+        top_tabs = QHBoxLayout()
+        top.setLayout(hbox(logo, vbox(label("TTS Studio", "logo"), label("Текст на входе, готовая реплика на выходе", "logosub"), s=0), 1, top_tabs, 1,
                            label(f"v{APP_VERSION}", "logosub"), self.btn_update, mkbtn("⚙  Настройки", lambda: self.settings.show_animated(), "Темы, папки, анимации, API-ключ"), m=0, s=10))
         top.layout().setContentsMargins(16, 8, 16, 8)
         self.banner = QFrame(); self.banner.setObjectName("banner")
@@ -1178,7 +1445,7 @@ class MainWindow(QMainWindow):
         sp = QSplitter(Qt.Orientation.Horizontal); sp.setChildrenCollapsible(False); sp.addWidget(col); sp.addWidget(self._build_right()); sp.setSizes([620, 880]); self.splitter = sp
         sp.widget(1).layout().setContentsMargins(4, 8, 10, 8); sp.setObjectName("modern")
         self.bg = AnimatedBg() if gl_available() else StaticBg()
-        self.bg.setLayout(vbox(top, (sp, 1), s=0)); self.setCentralWidget(self.bg)
+        top_tabs.addLayout(self._make_pages(sp)); self.bg.setLayout(vbox(top, (self.pages, 1), s=0)); self.setCentralWidget(self.bg)
 
     def _add_gen_effects(self):
         """Кнопка генерации: свечение при наведении и бегущий градиент, пока идёт генерация."""
@@ -1200,11 +1467,12 @@ class MainWindow(QMainWindow):
         sp.addWidget(left); sp.addWidget(self._build_right()); sp.setSizes([600, 900]); self.splitter = sp
         top = QFrame(); top.setObjectName("topbar")
         self._make_theme_box(); self._make_update_btn()
-        top.setLayout(hbox(label("🎙", "logoicon"), vbox(label("TTS Studio", "logo"), label("OpenRouter  ×  ElevenLabs v4", "logosub"), s=0), 1,
+        tabs = self._make_pages(sp)
+        top.setLayout(hbox(label("🎙", "logoicon"), vbox(label("TTS Studio", "logo"), label("OpenRouter  ×  ElevenLabs v4", "logosub"), s=0), 1, tabs, 1,
                            label(f"v{APP_VERSION}", "logosub"), self.btn_update, mkbtn("⚙ Настройки", lambda: self.settings.show_animated(), "Интерфейс, темы, папки"),
                            label("Стиль:", "logosub"), self.cb_theme, m=0, s=10))
         top.layout().setContentsMargins(16, 8, 16, 8)
-        c = QWidget(); c.setLayout(vbox(top, (sp, 1), s=0)); self.setCentralWidget(c)
+        c = QWidget(); c.setLayout(vbox(top, (self.pages, 1), s=0)); self.setCentralWidget(c)
 
     # ---------- обновление программы
     def _update_offer(self, tag):
@@ -1227,7 +1495,7 @@ class MainWindow(QMainWindow):
             self.btn_update.setText("✓ Последняя версия"); self.status(f"У вас последняя версия: {APP_VERSION}")
             def reset(): self.btn_update.setEnabled(True); self.btn_update.setText(UPDATE_TEXT)
             return QTimer.singleShot(4000, reset)
-        if self.gen_timer.isActive():  # не обрываем идущую генерацию
+        if self.busy():  # не обрываем идущую генерацию
             self.btn_update.setText("Ждём генерацию…"); return QTimer.singleShot(1000, lambda: self._on_update_ready(tag, path))
         exe = Path(sys.executable); old = exe.with_name(exe.name + ".old")
         try:  # Windows не даёт перезаписать запущенный exe, но позволяет его переименовать
@@ -1390,10 +1658,12 @@ class MainWindow(QMainWindow):
             if c.get("geometry") and c.get("geometry_scale") == UI_SCALE: self.restoreGeometry(QByteArray.fromHex(c["geometry"].encode()))  # при другом масштабе окно может не поместиться
             if c.get("splitter") and c.get("geometry_scale") == UI_SCALE: self.splitter.restoreState(QByteArray.fromHex(c["splitter"].encode()))
             else: QTimer.singleShot(0, self._default_split)  # окно уже получило размер: левая колонка 40%, лента 60%
+            if c.get("free_splitter") and c.get("geometry_scale") == UI_SCALE: self.free.split.restoreState(QByteArray.fromHex(c["free_splitter"].encode()))
+            else: QTimer.singleShot(0, lambda: self._split_40(self.free.split))
         except Exception: pass
 
-    def _default_split(self):
-        w = self.splitter.width(); self.splitter.setSizes([int(w * .4), w - int(w * .4)])
+    def _split_40(self, sp): w = max(sp.width(), self.width() - 10); sp.setSizes([int(w * .4), w - int(w * .4)])
+    def _default_split(self): self._split_40(self.splitter)
 
     def save_cfg(self):
         if self._loading: return
@@ -1403,7 +1673,8 @@ class MainWindow(QMainWindow):
                         voice=self.voice(), custom_voices=self.custom_voices, theme=CURRENT_THEME, language=self.cb_lang.currentText(), seed=self.ed_seed.text().strip(),
                         extended=self.chk_ext.isChecked(), autoplay=self.player.autoplay.isChecked(), custom_tags=self.custom_tags,
                         geometry=bytes(self.saveGeometry().toHex()).decode(), splitter=bytes(self.splitter.saveState().toHex()).decode(),
-                        ui=UI_MODE, anim_bg=ANIM_BG, anim_ui=ANIM_UI, geometry_scale=UI_SCALE, **({"el_open": self.btn_el.isChecked()} if hasattr(self, "btn_el") else {}),
+                        ui=UI_MODE, anim_bg=ANIM_BG, anim_ui=ANIM_UI, geometry_scale=UI_SCALE, free=self.free.state(), free_tab=self.pages.currentIndex() == 1,
+                        free_splitter=bytes(self.free.split.saveState().toHex()).decode(), **({"el_open": self.btn_el.isChecked()} if hasattr(self, "btn_el") else {}),
                         **{k: s.value() / 100 for k, s in (("stability", self.sl_stab), ("similarity", self.sl_sim), ("style", self.sl_style), ("speed", self.sl_speed))})
         try: save_json(CONFIG_PATH, self.cfg)
         except OSError as e: self.status(f"Не удалось сохранить config.json: {e}")
@@ -1615,6 +1886,7 @@ class MainWindow(QMainWindow):
 
     # ---------- generation
     def generate(self):
+        if self.pages.currentIndex() == 1: return self.free.generate()
         if self.gen_timer.isActive(): return
         key, model, voice, text = self.ed_key.text().strip(), self.model(), self.voice(), self.txt.toPlainText().strip()
         if not key: return self._need_key("Введите API-ключ OpenRouter (sk-or-…).")
@@ -1693,20 +1965,21 @@ class MainWindow(QMainWindow):
         else: QDesktopServices.openUrl(QUrl.fromLocalFile(str(d)))
 
     def pick_dir(self, kind):
-        cur = CACHE_DIR if kind == "cache" else PREVIEW_DIR
+        cur = {"cache": CACHE_DIR, "preview": PREVIEW_DIR, "free": FREE_DIR}[kind]
         d = QFileDialog.getExistingDirectory(QApplication.activeWindow() or self, "Новая папка", str(cur))
         if d: self.move_dir(kind, Path(d))
 
     def move_dir(self, kind, new):
         """Меняет папку кэша или превью и переносит туда файлы программы. При ошибке старая папка остаётся рабочей."""
-        new = Path(new); old = CACHE_DIR if kind == "cache" else PREVIEW_DIR; parent = QApplication.activeWindow() or self
+        new = Path(new); old, patterns, cfg_key, dir_arg = {"cache": (CACHE_DIR, CACHE_PATTERNS, "cache_dir", "cache"), "preview": (PREVIEW_DIR, PREVIEW_PATTERNS, "preview_dir", "previews"),
+                                                             "free": (FREE_DIR, FREE_PATTERNS, "free_dir", "free")}[kind]; parent = QApplication.activeWindow() or self
         if new.resolve() == old.resolve(): return
-        if self.gen_timer.isActive(): return QMessageBox.information(parent, "Папки", "Дождитесь окончания генерации.")
+        if self.busy(): return QMessageBox.information(parent, "Папки", "Дождитесь окончания генерации.")
         try:
             new.mkdir(parents=True, exist_ok=True); probe = new / ".tts_write_test"; probe.write_bytes(b""); probe.unlink()
         except OSError as e: return QMessageBox.critical(parent, "Папки", f"В эту папку нельзя записывать:\n{e}")
-        self.player.release(); QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try: errors = move_files(old, new, CACHE_PATTERNS if kind == "cache" else PREVIEW_PATTERNS)
+        self.player.release(); self.free.player.release(); QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try: errors = move_files(old, new, patterns)
         except OSError as e: errors = [str(e)]
         finally: QApplication.restoreOverrideCursor()
         if errors: return QMessageBox.critical(parent, "Папки", "Часть файлов не удалось перенести, папка не изменена:\n" + "\n".join(errors[:6]))
@@ -1715,13 +1988,13 @@ class MainWindow(QMainWindow):
             except OSError: pass
         try: old.rmdir()  # только если опустела
         except OSError: pass
-        set_dirs(**({"cache": new} if kind == "cache" else {"previews": new})); self.cfg["cache_dir" if kind == "cache" else "preview_dir"] = str(new)
+        set_dirs(**{dir_arg: new}); self.cfg[cfg_key] = str(new)
         self.save_cfg(); self.update_cache_status(); self.update_ru_dot(); self.settings.refresh_dirs(); self.status(f"Папка изменена: {new}")
 
     def set_scale(self, val, dlg):
         if val == self.cfg.get("ui_scale", "auto"): return
         parent = QApplication.activeWindow() or self
-        if self.gen_timer.isActive() or QMessageBox.question(parent, "Масштаб", "Программа перезапустится, чтобы применить масштаб. Текст и настройки сохранятся. Продолжить?") != QMessageBox.StandardButton.Yes:
+        if self.busy() or QMessageBox.question(parent, "Масштаб", "Программа перезапустится, чтобы применить масштаб. Текст и настройки сохранятся. Продолжить?") != QMessageBox.StandardButton.Yes:
             dlg.cb_scale.setCurrentIndex(max(0, dlg.cb_scale.findData(self.cfg.get("ui_scale", "auto")))); return
         self.cfg["ui_scale"] = val; self.cfg["update_draft"] = self.txt.toPlainText(); self.restart_exe = Path(sys.executable); dlg.accept(); QTimer.singleShot(0, self.close)
 
@@ -1738,7 +2011,7 @@ class MainWindow(QMainWindow):
         """Новый интерфейс строится как новое окно: дубли, настройки и текст в редакторе сохраняются."""
         global UI_MODE
         if mode == UI_MODE: return
-        if self.gen_timer.isActive():
+        if self.busy():
             (self.settings.rb_modern if UI_MODE == "modern" else self.settings.rb_classic).setChecked(True)
             return QMessageBox.information(QApplication.activeWindow() or self, "Интерфейс", "Дождитесь окончания генерации.")
         if dlg: dlg.accept()
@@ -1754,10 +2027,12 @@ class MainWindow(QMainWindow):
         if not Path(folder).is_dir():
             if not self.choose_folder(): return
             folder = self.ed_folder.text().strip()
-        src = CACHE_DIR / card.take["file"]
+        free = bool(card.take.get("free")); src = (FREE_DIR if free else CACHE_DIR) / card.take["file"]
         if not src.is_file(): return QMessageBox.critical(self, "Ошибка", "Файл дубля пропал из кэша.")
         name = sanitize_filename(card.ed_name.text()) or auto_name(card.take.get("text", "")); card.ed_name.setText(name)
-        ns = norm_settings(self.cfg); target, dest, group, note, norm = self.cb_norm.currentData(), Path(folder), "", "", None
+        ns = norm_settings(self.cfg); target, dest, group, note, norm = self.cb_norm.currentData(), Path(folder) / "Бесплатная" if free else Path(folder), "", "", None
+        try: dest.mkdir(parents=True, exist_ok=True)
+        except OSError as e: return QMessageBox.critical(QApplication.activeWindow() or self, "Ошибка сохранения", f"Не удалось создать папку:\n{e}")
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             if ns["sort"] and AUDIO_OK:
@@ -1777,7 +2052,7 @@ class MainWindow(QMainWindow):
             except OSError as e: return QMessageBox.critical(self, "Ошибка сохранения", f"Не удалось скопировать файл:\n{e}")
         card.take.update(saved=True, exported_name=dst.name, exported_path=str(dst),
                          export_lufs=round(norm["after"], 1) if norm else None, export_group=group)
-        self.save_index(); card.mark_saved()
+        (self.free.save_index if free else self.save_index)(); card.mark_saved()
         if norm: note += f"   ·   громкость {norm['before']:.1f} → {norm['after']:.1f} LUFS" + ("  (лимитер пиков)" if norm["limited"] else "")
         self.status(f"✓ Сохранено: {dst}" + ("   (имя занято — добавлен суффикс версии)" if dst.stem != name else "") + note, 15000)
 
@@ -1817,7 +2092,7 @@ class MainWindow(QMainWindow):
         if self.empty_lbl: self.empty_lbl.setVisible(not self.takes)
 
     def closeEvent(self, e):
-        self.save_cfg(); self.player.release()
+        self.save_cfg(); self.player.release(); self.free.player.release()
         for w in list(self.workers):
             if not w.wait(1500): w.terminate(); w.wait(500)
         e.accept()
@@ -1933,6 +2208,7 @@ QSplitter#modern::handle { background: $panel_a; }
 QSplitter#modern::handle:hover { background: $accent; }
 QScrollArea#clear, QScrollArea#clear > QWidget, QScrollArea#clear > QWidget > QWidget { background: transparent; }
 QSplitter#modern > QWidget { background: transparent; }
+QStackedWidget#pages, QStackedWidget#pages > QWidget { background: transparent; }
 QStatusBar { background: $panel; }
 QDialog#settings QListWidget#nav { background: $panel; border: 1px solid $border; border-radius: 12px; padding: 8px; }
 QListWidget#nav::item { padding: 10px 12px; border-radius: 9px; font-weight: 600; margin: 2px 0; }
@@ -1945,6 +2221,9 @@ QLabel#emptylbl { color: $dim; }
 QListWidget#nav::item { padding: 9px 10px; }
 QListWidget#nav::item:selected { background: $accent; color: $on_accent; }
 QRadioButton { background: transparent; spacing: 7px; }
+QPushButton#tabbtn { padding: 6px 16px; font-weight: 700; color: $dim; }
+QPushButton#tabbtn:checked { background: $accent; color: $on_accent; border-color: $accent; }
+QLabel#pagesub { font-size: 9pt; }
 QRadioButton::indicator { width: 14px; height: 14px; border-radius: 8px; border: 2px solid $border_hi; background: $input; }
 QRadioButton::indicator:hover { border-color: $accent; }
 QRadioButton::indicator:checked { border: 2px solid $accent; background: qradialgradient(cx:.5,cy:.5,radius:.5,fx:.5,fy:.5, stop:0 $accent, stop:.55 $accent, stop:.65 $input); }
