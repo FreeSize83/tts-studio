@@ -26,7 +26,7 @@ try:  # нормализация громкости (numpy + miniaudio для д
 except Exception as _e:
     AUDIO_OK, AUDIO_ERR = False, f"{type(_e).__name__}: {_e}"
 
-APP_VERSION = "1.3.0"  # должна совпадать с git-тегом релиза (v1.0.0): это проверяет сборка в GitHub Actions
+APP_VERSION = "1.3.1"  # должна совпадать с git-тегом релиза (v1.0.0): это проверяет сборка в GitHub Actions
 RELEASE_API = "https://api.github.com/repos/FreeSize83/tts-studio/releases/latest"
 RELEASE_ASSET = "TTS-Studio.exe"
 FROZEN = getattr(sys, "frozen", False)
@@ -979,14 +979,18 @@ class VoicePickerDialog(QDialog):
 
 # ---------------------------------------------------------------- бесплатная генерация
 QWEN_HOST = "https://qwen-qwen3-tts.hf.space"
+QWEN_DESIGN_MIRRORS = ("https://ayush77uh-qwen3-tts-api.hf.space", "https://jymnils-qwen3-tts.hf.space")  # запасные серверы без лимита видеокарты: медленнее, держат сторонние авторы
+QWEN_SPEAKER_MIRROR = "https://henrybit-qwen3-tts-customvoice.hf.space"
 CHATTERBOX_HOST = "https://resembleai-chatterbox-multilingual-tts.hf.space"
+CHATTERBOX_MIRROR = "https://tgpro1-chatterbox-multilingual-tts.hf.space"
+CHATTERBOX_MIRROR_V2 = "https://rahul7star-chatterbox-multilingual-tts.hf.space"
 VOXCPM_HOST = "https://openbmb-voxcpm-demo.hf.space"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 GEMINI_MODEL = "gemini-3.8-flash-tts"
 FREE_ENGINES = (
-    ("qwen_design", "Qwen3-TTS: голос по описанию", "Qwen3-TTS", "Опишите словами голос и эмоцию. Голос может меняться от дубля к дублю. Без токена хватает на несколько реплик в день."),
-    ("qwen_speaker", "Qwen3-TTS: готовые голоса", "Qwen3-TTS", "Постоянный голос и указание, как произносить текст. Без токена хватает на несколько реплик в день."),
-    ("chatterbox", "Chatterbox: сила эмоции", "Chatterbox", "Ползунок силы эмоции и повторяемый результат через seed. До 300 символов за раз. Без токена хватает на несколько реплик в день."),
+    ("qwen_design", "Qwen3-TTS: голос по описанию", "Qwen3-TTS", "Опишите словами голос и эмоцию. Голос может меняться от дубля к дублю. Если лимит исчерпан, работает запасной сервер: до 2–3 минут."),
+    ("qwen_speaker", "Qwen3-TTS: готовые голоса", "Qwen3-TTS", "Постоянный голос и указание, как произносить текст. Если лимит исчерпан, работает запасной сервер: около минуты."),
+    ("chatterbox", "Chatterbox: сила эмоции", "Chatterbox", "Ползунок силы эмоции и повторяемый результат через seed. До 300 символов за раз. Если лимит исчерпан, работает запасной сервер: 1–2 минуты."),
     ("voxcpm", "VoxCPM2: голос по описанию", "VoxCPM2", "Опишите голос и подачу словами. Язык определяется по тексту. Работает без дневной квоты на видеокарту."),
     ("gemini", "Gemini TTS: нужен бесплатный ключ Google", "Gemini TTS", "Стиль словами и теги вроде <laugh> прямо в тексте. Google не обслуживает этот API в России и Беларуси."))
 FREE_LANGS = (("Русский", "ru", "Russian"), ("English", "en", "English"), ("Deutsch", "de", "German"), ("Français", "fr", "French"), ("Español", "es", "Spanish"), ("Português", "pt", "Portuguese"))
@@ -1004,28 +1008,53 @@ FREE_EMOTIONS = (("Спокойно", "Спокойный ровный голо�
 
 def free_error_text(raw):
     t = str(raw or "").strip().strip('"')
-    if not t or t == "null": return "Сервис вернул ошибку без описания. Скорее всего, закончилась бесплатная дневная квота или он занят. Попробуйте VoxCPM2, добавьте токен Hugging Face или повторите позже."
-    if "quota" in t.lower(): return "Закончилась бесплатная дневная квота этого сервиса. Выберите другой движок, повторите позже или добавьте токен Hugging Face.\n\n" + t[:300]
-    return t[:600]
+    if "quota" in t.lower(): return "Закончилась бесплатная дневная квота."
+    return t[:300] or "Сервер вернул ошибку без описания."
 
-def gradio_call(host, endpoint, data, token=""):
-    """Вызов публичного демо Hugging Face по HTTP-API Gradio: запрос, затем ожидание результата в потоке событий."""
+def gradio_call(host, api, data, token="", read_timeout=420):
+    """Вызов публичного демо Hugging Face. Протокол очереди Gradio, в отличие от /call, сообщает причину ошибки."""
     h = {"Authorization": f"Bearer {token}"} if token else {}
-    r = requests.post(f"{host}/gradio_api/call/{endpoint}", json={"data": data}, headers=h, timeout=(15, 60))
-    if r.status_code != 200: raise RuntimeError(f"Сервис недоступен: HTTP {r.status_code}. Попробуйте другой движок.")
-    kind = None
-    with requests.get(f"{host}/gradio_api/call/{endpoint}/{r.json()['event_id']}", stream=True, headers=h, timeout=(15, 300)) as ev:
+    cfg = requests.get(host + "/config", headers=h, timeout=(15, 45)); cfg.raise_for_status()
+    dep = next((d for d in cfg.json().get("dependencies", []) if d.get("api_name") == api), None)
+    if dep is None: raise RuntimeError("У сервера изменился интерфейс.")
+    session = uuid.uuid4().hex[:12]
+    r = requests.post(host + "/gradio_api/queue/join", json={"data": data, "fn_index": dep["id"], "session_hash": session}, headers=h, timeout=(15, 45)); r.raise_for_status()
+    with requests.get(host + "/gradio_api/queue/data", params={"session_hash": session}, stream=True, headers=h, timeout=(15, read_timeout)) as ev:
         ev.encoding = "utf-8"
         for line in ev.iter_lines(decode_unicode=True):
-            if line.startswith("event:"): kind = line[6:].strip()
-            elif line.startswith("data:") and kind == "error": raise RuntimeError(free_error_text(line[5:]))
-            elif line.startswith("data:") and kind == "complete": return json.loads(line[5:].strip())
-    raise RuntimeError("Сервис закрыл соединение, не вернув результат. Попробуйте ещё раз.")
+            if not line.startswith("data:"): continue
+            m = json.loads(line[5:])
+            if m.get("msg") == "process_completed":
+                out = m.get("output") or {}
+                if not m.get("success"): raise RuntimeError(free_error_text(out.get("error")))
+                return out.get("data") or []
+    raise RuntimeError("Сервер закрыл соединение, не вернув результат.")
 
 def gradio_audio(result, token=""):
     url = next((x.get("url") for x in result if isinstance(x, dict) and x.get("url")), None)
-    if not url: raise RuntimeError("Сервис не вернул аудио.")
+    if not url: raise RuntimeError(free_error_text(next((x for x in result if isinstance(x, str)), "Сервер не вернул аудио.")))
     a = requests.get(url, headers={"Authorization": f"Bearer {token}"} if token else {}, timeout=(15, 120)); a.raise_for_status(); return a.content
+
+def free_routes(p):
+    """Серверы по порядку: официальный, затем запасные. Токен Hugging Face уходит только на официальные серверы авторов моделей."""
+    tok = p.get("hf_token", ""); e, text = p["engine"], p["text"]
+    if e == "qwen_design":
+        args = [text, p["lang_name"], p["desc"]]
+        return [(host, lambda h=host, t=(tok if host == QWEN_HOST else ""): gradio_audio(gradio_call(h, "generate_voice_design", args, t), t)) for host in (QWEN_HOST, *QWEN_DESIGN_MIRRORS)]
+    if e == "qwen_speaker":
+        names = {"Uncle_fu": "Uncle_Fu", "Ono_anna": "Ono_Anna"}; args = [text, p["lang_name"], p["speaker"], p["instruct"], "1.7B"]
+        mirror = [text, p["lang_name"], names.get(p["speaker"], p["speaker"]), p["instruct"], .9, 1.0, 50, 1.05, 2048, True, 42, True]
+        return [(QWEN_HOST, lambda: gradio_audio(gradio_call(QWEN_HOST, "generate_custom_voice", args, tok), tok)),
+                (QWEN_SPEAKER_MIRROR, lambda: gradio_audio(gradio_call(QWEN_SPEAKER_MIRROR, "generate", mirror))),
+                (QWEN_DESIGN_MIRRORS[0], lambda: gradio_audio(gradio_call(QWEN_DESIGN_MIRRORS[0], "generate_custom_voice", args)))]
+    if e == "chatterbox":
+        def run(host, t=""):
+            ref = gradio_call(host, "on_language_change", [p["lang"], None, ""], t)[0]  # встроенный образец голоса для языка
+            return gradio_audio(gradio_call(host, "generate_tts_audio", [text, p["lang"], ref, p["exaggeration"], p["temperature"], p["seed"], p["cfg"]], t), t)
+        return [(CHATTERBOX_HOST, lambda: run(CHATTERBOX_HOST, tok)), (CHATTERBOX_MIRROR, lambda: run(CHATTERBOX_MIRROR)),
+                (CHATTERBOX_MIRROR_V2, lambda: gradio_audio(gradio_call(CHATTERBOX_MIRROR_V2, "generate_tts_audio_v2", [text, p["lang"], "speak", "", "", p["exaggeration"], p["temperature"], p["seed"], p["cfg"]])))]
+    if e == "voxcpm": return [(VOXCPM_HOST, lambda: gradio_audio(gradio_call(VOXCPM_HOST, "generate", [text, p["control"], None, False, "", p["vox_cfg"], False, False])))]
+    return [("Gemini", lambda: gemini_audio(p))]
 
 def gemini_audio(p):
     body = {"model": GEMINI_MODEL, "input": [{"type": "user_input", "content": [{"type": "text", "text": p["text"], "annotations": [{"type": "speech_metadata", "style": p["style"]}] if p["style"] else []}]}],
@@ -1046,21 +1075,18 @@ def audio_bytes_to_mp3(data, dst, bitrate=192):
     dst = Path(dst); tmp = dst.with_name(dst.name + ".part"); tmp.write_bytes(enc.encode(d.samples.tobytes()) + enc.flush()); os.replace(tmp, dst)
 
 class FreeTTSWorker(QThread):
-    ok = pyqtSignal(str); fail = pyqtSignal(str)
+    ok = pyqtSignal(str); fail = pyqtSignal(str); note = pyqtSignal(str)
     def __init__(self, params, out): super().__init__(); self.p, self.out = params, Path(out)
     def run(self):
-        p = self.p; tok = p.get("hf_token", ""); e = p["engine"]
-        try:
-            if e == "qwen_design": data = gradio_audio(gradio_call(QWEN_HOST, "generate_voice_design", [p["text"], p["lang_name"], p["desc"]], tok), tok)
-            elif e == "qwen_speaker": data = gradio_audio(gradio_call(QWEN_HOST, "generate_custom_voice", [p["text"], p["lang_name"], p["speaker"], p["instruct"], "1.7B"], tok), tok)
-            elif e == "chatterbox":
-                ref = gradio_call(CHATTERBOX_HOST, "on_language_change", [p["lang"], None, ""], tok)[0]  # встроенный образец голоса для языка
-                data = gradio_audio(gradio_call(CHATTERBOX_HOST, "generate_tts_audio", [p["text"], p["lang"], ref, p["exaggeration"], p["temperature"], p["seed"], p["cfg"]], tok), tok)
-            elif e == "voxcpm": data = gradio_audio(gradio_call(VOXCPM_HOST, "generate", [p["text"], p["control"], None, False, "", p["vox_cfg"], False, False], tok), tok)
-            else: data = gemini_audio(p)
-            audio_bytes_to_mp3(data, self.out); self.ok.emit(str(self.out))
-        except requests.exceptions.RequestException as ex: self.fail.emit(f"Нет связи с сервисом: {type(ex).__name__}. Проверьте интернет или выберите другой движок.")
-        except Exception as ex: self.fail.emit(str(ex) or type(ex).__name__)
+        errors = []
+        for i, (host, call) in enumerate(free_routes(self.p)):
+            if i: self.note.emit(f"Предыдущий сервер не ответил: {errors[-1]} Пробую запасной, это может занять 1–3 минуты…")
+            try:
+                data = call(); audio_bytes_to_mp3(data, self.out); return self.ok.emit(str(self.out))
+            except requests.exceptions.RequestException as ex: errors.append(f"нет связи ({type(ex).__name__}).")
+            except Exception as ex: errors.append(str(ex) or type(ex).__name__)
+        one = len(errors) == 1
+        self.fail.emit(errors[0] if one and self.p["engine"] == "gemini" else ("Сервер не ответил" if one else "Ни один сервер этого движка не ответил") + ":\n\n" + "\n".join(f"• {e}" for e in errors) + "\n\nПопробуйте другой движок или повторите позже.")
 
 class FreeTab(QWidget):
     """Отдельная вкладка: свой текст, плеер, лента и папка. С платной генерацией не пересекается: ключ OpenRouter здесь не используется."""
@@ -1082,12 +1108,12 @@ class FreeTab(QWidget):
         chips = QGridLayout(); chips.setSpacing(4)
         for i, em in enumerate(FREE_EMOTIONS):
             chips.addWidget(mkbtn(em[0], lambda e=em: self._emotion(e), "Подставить эту эмоцию в настройки движка", "tag"), 0, i)
-        self.ed_token = QLineEdit(c.get("hf_token", "")); self.ed_token.setEchoMode(QLineEdit.EchoMode.Password); self.ed_token.setPlaceholderText("необязательно: дневная квота 5 минут вместо 2")
+        self.ed_token = QLineEdit(c.get("hf_token", "")); self.ed_token.setEchoMode(QLineEdit.EchoMode.Password); self.ed_token.setPlaceholderText("необязательно: 5 минут быстрой видеокарты в день вместо 2")
         self.row_token = QWidget(); self.row_token.setLayout(hbox(label("Токен Hugging Face:"), (self.ed_token, 1), mkbtn("Получить", lambda: QDesktopServices.openUrl(QUrl("https://huggingface.co/settings/tokens")))))
         self.ed_gkey = QLineEdit(c.get("gemini_key", "")); self.ed_gkey.setEchoMode(QLineEdit.EchoMode.Password); self.ed_gkey.setPlaceholderText("ключ из Google AI Studio")
         self.row_gkey = QWidget(); self.row_gkey.setLayout(hbox(label("Ключ Google:"), (self.ed_gkey, 1), mkbtn("Получить", lambda: QDesktopServices.openUrl(QUrl("https://aistudio.google.com/apikey")))))
         v = QVBoxLayout(g_eng); v.addWidget(self.cb_engine); v.addWidget(self.lbl_desc); v.addWidget(self.row_lang); v.addWidget(self.panels); v.addLayout(chips); v.addWidget(self.row_token); v.addWidget(self.row_gkey)
-        v.addWidget(label("Текст уходит на публичный сервис выбранной модели. Такие сервисы бывают заняты, имеют дневные лимиты и могут измениться без предупреждения.", "pagesub", wrap=True))
+        v.addWidget(label("Текст уходит на публичные серверы, в том числе сторонних авторов. Не отправляйте конфиденциальное. Серверы бывают заняты и могут измениться без предупреждения.", "pagesub", wrap=True))
         # --- текст
         g_txt = QGroupBox("Текст для бесплатной озвучки"); tv = QVBoxLayout(g_txt)
         self.tag_row = QWidget(); self.tag_row.setLayout(hbox(*[mkbtn(t, lambda t=t: self._insert_tag(t), "Вставить тег", "tag") for t in GEMINI_TAGS], 1, s=4)); tv.addWidget(self.tag_row)
@@ -1183,7 +1209,7 @@ class FreeTab(QWidget):
         meta = {"id": uuid.uuid4().hex, "created": time.time(), "file": out.name, "text": text, "model": short, "voice": who, "free": True, "meta": summary, "params": {k: v for k, v in st.items() if k not in ("hf_token", "gemini_key", "text")},
                 "saved": False, "exported_name": "", "exported_path": ""}
         self.busy = True; self.started = time.time(); self.btn_gen.setEnabled(False); self.timer.start(); self._tick(); self.owner.save_cfg(); self.owner.status(f"Бесплатная генерация: {short}…", 0)
-        self.owner._start(FreeTTSWorker(st, out), lambda _p: self._ready(meta), self._failed)
+        w = FreeTTSWorker(st, out); w.note.connect(lambda m: self.owner.status(m, 0)); self.owner._start(w, lambda _p: self._ready(meta), self._failed)
     def _tick(self): self.btn_gen.setText(f"⏳  БЕСПЛАТНАЯ ГЕНЕРАЦИЯ…  {int(time.time() - self.started)} с")
     def _reset(self): self.busy = False; self.timer.stop(); self.btn_gen.setEnabled(True); self.btn_gen.setText(self.GEN_TEXT)
     def _failed(self, msg): self._reset(); self.owner.status("Ошибка бесплатной генерации"); QMessageBox.critical(QApplication.activeWindow() or self.owner, "Бесплатная генерация", msg)
