@@ -26,7 +26,7 @@ try:  # нормализация громкости (numpy + miniaudio для д
 except Exception as _e:
     AUDIO_OK, AUDIO_ERR = False, f"{type(_e).__name__}: {_e}"
 
-APP_VERSION = "1.3.1"  # должна совпадать с git-тегом релиза (v1.0.0): это проверяет сборка в GitHub Actions
+APP_VERSION = "1.4.0"  # должна совпадать с git-тегом релиза (v1.0.0): это проверяет сборка в GitHub Actions
 RELEASE_API = "https://api.github.com/repos/FreeSize83/tts-studio/releases/latest"
 RELEASE_ASSET = "TTS-Studio.exe"
 FROZEN = getattr(sys, "frozen", False)
@@ -129,6 +129,12 @@ def load_ui_prefs(cfg):
     UI_MODE = "classic" if cfg.get("ui") == "classic" else "modern"; ANIM_BG = bool(cfg.get("anim_bg", True)); ANIM_UI = bool(cfg.get("anim_ui", True))
 MODELS_URL = "https://openrouter.ai/api/v1/models?output_modalities=speech"
 SPEECH_URL = "https://openrouter.ai/api/v1/audio/speech"
+EL_API = "https://api.elevenlabs.io/v1"
+# модели при генерации напрямую через ElevenLabs своим ключом; в списке моделей они с приставкой «el:»
+EL_MODELS = (("eleven_v4", "Eleven v4"), ("eleven_v4_turbo", "Eleven v4 Turbo"), ("eleven_v3", "Eleven v3"),
+             ("eleven_multilingual_v2", "Multilingual v2"), ("eleven_flash_v2_5", "Flash v2.5"))
+def is_el(model): return str(model).startswith(("elevenlabs/", "el:"))
+def model_title(model): return f"ElevenLabs, свой ключ · {dict(EL_MODELS).get(model[3:], model[3:])}" if str(model).startswith("el:") else str(model)
 EL_VOICES_URL = "https://api.elevenlabs.io/v1/voices"
 EXTRA_HEADERS = {"HTTP-Referer": "https://localhost/tts-studio", "X-Title": "TTS Studio"}
 PRIORITY_MODELS = ["elevenlabs/eleven-v4-turbo", "elevenlabs/eleven-v4"]
@@ -243,7 +249,7 @@ def norm_voices(v):
 
 def voice_meta(voice, model):
     """Оформление голоса. Неизвестный голос (нет в VOICE_DB или не ElevenLabs) → безопасная заглушка, без KeyError."""
-    m = VOICE_DB.get(str(voice).lower()) if str(model).startswith("elevenlabs/") else None
+    m = VOICE_DB.get(str(voice).lower()) if is_el(model) else None
     return dict(m) if m else {"gender": "unknown", "age": "—", "accent": "—", "desc": UNKNOWN_DESC, "url": ""}
 
 def set_busy(btn, on):
@@ -673,6 +679,54 @@ class TTSWorker(QThread):
         except requests.Timeout: self.fail.emit("Превышено время ожидания ответа от OpenRouter.")
         except Exception as e: self.fail.emit(f"{type(e).__name__}: {e}")
 
+def el_error(r):
+    """Понятный текст ошибки ElevenLabs из ответа вида {"detail": {"status": ..., "message": ...}}."""
+    try: d = r.json().get("detail")
+    except Exception: d = None
+    status = (d.get("status") or d.get("code") or "") if isinstance(d, dict) else ""
+    msg = d.get("message", "") if isinstance(d, dict) else "; ".join(f"{'.'.join(map(str, x.get('loc', [])))}: {x.get('msg')}" for x in d) if isinstance(d, list) else (r.text or "")[:400]
+    hint = {401: "Проверьте API-ключ ElevenLabs.", 402: "Оплата не прошла или не хватает кредитов.", 429: "Слишком много запросов, подождите немного."}.get(r.status_code, "")
+    if "quota" in status or "credit" in msg.lower(): hint = "На балансе ElevenLabs закончились кредиты."
+    if r.status_code == 403: hint = "ElevenLabs отказал в доступе. Сервис закрыт для России и Беларуси, а также для некоторых VPN и серверов."
+    return f"ElevenLabs: HTTP {r.status_code}. {msg}".strip() + (f"\n\n{hint}" if hint else "")
+
+class ElevenLabsWorker(QThread):
+    """Генерация напрямую через ElevenLabs своим ключом, без OpenRouter."""
+    ok = pyqtSignal(str, str); fail = pyqtSignal(str)
+    def __init__(self, key, voice_id, model_id, text, p, out):
+        super().__init__(); self.key, self.voice_id, self.model_id, self.text, self.p, self.out = key, voice_id, model_id, text, p, Path(out)
+    def run(self):
+        p = self.p
+        body = {"text": self.text, "model_id": self.model_id,
+                "voice_settings": {"stability": round(p["stability"], 2), "similarity_boost": round(p["similarity"], 2), "style": round(p["style"], 2),
+                                   "use_speaker_boost": True, "speed": round(float(p.get("speed", 1.0)), 2)}}
+        if p.get("language") and p["language"] != "auto" and self.model_id != "eleven_multilingual_v2": body["language_code"] = p["language"]  # v2 language_code не принимает
+        if str(p.get("seed", "")).strip(): body["seed"] = min(int(p["seed"]), 4294967295)
+        for k in ("previous_text", "next_text"):
+            if str(p.get(k, "")).strip(): body[k] = p[k].strip()
+        try:
+            r = requests.post(f"{EL_API}/text-to-speech/{self.voice_id}", params={"output_format": "mp3_44100_128"}, json=body,
+                              headers={"xi-api-key": self.key}, timeout=(15, 240))
+            if r.status_code != 200: return self.fail.emit(el_error(r))
+            if not r.content or "json" in r.headers.get("Content-Type", "").lower(): return self.fail.emit("ElevenLabs вернул ответ без аудио:\n" + r.text[:800])
+            tmp = self.out.with_name(self.out.name + ".part"); tmp.write_bytes(r.content); os.replace(tmp, self.out); self.ok.emit(str(self.out), "")
+        except requests.Timeout: self.fail.emit("Превышено время ожидания ответа от ElevenLabs.")
+        except requests.RequestException as e: self.fail.emit(f"Нет связи с ElevenLabs ({type(e).__name__}). Если вы в России или Беларуси, сервис недоступен без смены сети.")
+        except Exception as e: self.fail.emit(f"{type(e).__name__}: {e}")
+
+class ElAccountWorker(QThread):
+    """Голоса аккаунта и остаток кредитов ElevenLabs."""
+    ok = pyqtSignal(dict); fail = pyqtSignal(str)
+    def __init__(self, key): super().__init__(); self.key = key
+    def run(self):
+        try:
+            h = {"xi-api-key": self.key}; r = requests.get(f"{EL_API}/voices", headers=h, timeout=(10, 30))
+            if r.status_code != 200: return self.fail.emit(el_error(r))
+            voices = [{"name": v.get("name", "").strip(), "id": v.get("voice_id", ""), "url": v.get("preview_url") or ""} for v in r.json().get("voices") or [] if v.get("voice_id")]
+            sub = requests.get(f"{EL_API}/user/subscription", headers=h, timeout=(10, 30)); s = sub.json() if sub.status_code == 200 else {}
+            self.ok.emit({"voices": voices, "used": s.get("character_count"), "limit": s.get("character_limit"), "reset": s.get("next_character_count_reset_unix")})
+        except Exception as e: self.fail.emit(f"Нет связи с ElevenLabs ({type(e).__name__})")
+
 # ---------------------------------------------------------------- widgets
 class TextEdit(QPlainTextEdit):
     submit = pyqtSignal()
@@ -767,11 +821,11 @@ class TakeCard(QFrame):
         super().__init__(); self.take = take; self.setObjectName("card"); p = {} if take.get("free") else take.get("params", {})
         ts = time.strftime("%d.%m.%Y  %H:%M:%S", time.localtime(take.get("created", 0)))
         char = take.get("character") or ""
-        head = hbox(label(f"<b>{ts}</b>"), label(esc(take.get("model", "")), "chip"), label(f"🎤 {esc(take.get('voice', ''))}", "chip" if char else "chipacc"),
+        head = hbox(label(f"<b>{ts}</b>"), label(esc(model_title(take.get("model", ""))), "chip"), label(f"🎤 {esc(take.get('voice', ''))}", "chip" if char else "chipacc"),
                     *([label(f"🎭 {esc(char)}", "chipacc")] if char else []), 1, s=8)
         meta = f"Stab {p.get('stability', 0):.2f} · Sim {p.get('similarity', 0):.2f} · Style {p.get('style', 0):.2f} · " \
                f"Speed {p.get('speed', 1):.2f} · Seed {p.get('seed') or '—'} · Lang {p.get('language', '—')}"
-        if not take.get("model", "").startswith("elevenlabs/") or not p.get("extended", True): meta += " · базовые параметры"
+        if not is_el(take.get("model", "")) or not p.get("extended", True): meta += " · базовые параметры"
         if take.get("free"): meta = take.get("meta", "")
         if p.get("fallback"): meta += " · ⚠ без расширенных (fallback)"
         text = take.get("text", "")
@@ -1337,7 +1391,11 @@ class SettingsDialog(QDialog):
     def _page_key(self):
         o = self.owner; w = QWidget()
         w.setLayout(vbox(self._head("API-ключ OpenRouter", "Хранится только на этом компьютере. Отправляется только в OpenRouter."),
-                         hbox((o.ed_key, 1), o.btn_eye, mkbtn("Получить ключ", lambda: QDesktopServices.openUrl(QUrl("https://openrouter.ai/keys")))), 1, s=8))
+                         hbox((o.ed_key, 1), o.btn_eye, mkbtn("Получить ключ", lambda: QDesktopServices.openUrl(QUrl("https://openrouter.ai/keys")))), label("", "hint"),
+                         self._head("Свой ключ ElevenLabs (необязательно)", "С ним в списке моделей появятся модели ElevenLabs, которые генерируют напрямую с вашего аккаунта, "
+                                    "без OpenRouter: доступны ваши голоса и клоны, расход идёт из кредитов ElevenLabs. Сервис не работает в России и Беларуси."),
+                         hbox((o.ed_el_key, 1), o.btn_el_eye, mkbtn("Получить ключ", lambda: QDesktopServices.openUrl(QUrl("https://elevenlabs.io/app/settings/api-keys")))),
+                         o.lbl_el_acc, 1, s=8))
         return w
 
     # --- Громкость
@@ -1389,6 +1447,7 @@ class MainWindow(QMainWindow):
         scr = QApplication.primaryScreen().availableGeometry(); self.resize(min(1500, int(scr.width() * .92)), min(940, int(scr.height() * .92)))
         self.cfg = load_json(CONFIG_PATH, {}); dir_warn = resolve_dirs(self.cfg); self.takes = [t for t in load_json(INDEX_PATH, []) if isinstance(t, dict) and t.get("file")]
         self.models, self.en_previews, self.en_state = {}, {}, "loading"
+        self.el_voices, self.el_ids, self.el_acc, self.el_state = [], {}, {}, "none"
         self.workers, self.cards, self.custom_tags = set(), {}, list(self.cfg.get("custom_tags", []))
         self.cur_voice, self.voice_list, self.custom_voices = "", [], [str(v) for v in self.cfg.get("custom_voices", []) if str(v).strip()]
         self.wanted_model = self.cfg.get("model") or PRIORITY_MODELS[0]; self.wanted_voice = self.cfg.get("voice") or "george"
@@ -1406,7 +1465,7 @@ class MainWindow(QMainWindow):
         self.update_cache_status()
         self.status(f"Автоочистка: удалено старых дублей (> 7 дней): {removed}" if removed else "Готово к работе")
         if dir_warn: self.status(f"Папка недоступна, используется другая: {', '.join(dir_warn)}", 20000)
-        self.refresh_models(); self.fetch_en_previews()
+        self.refresh_models(); self.fetch_en_previews(); self.fetch_el_account()
         self.restart_exe = None
         draft = self.cfg.pop("update_draft", "")  # текст из редактора, сохранённый перед обновлением
         if draft: self.txt.setPlainText(draft)
@@ -1545,6 +1604,8 @@ class MainWindow(QMainWindow):
         gl.addWidget(label("Папка сохранения:"), 1, 0); gl.addWidget(self.ed_folder, 1, 1)
         gl.addLayout(hbox(mkbtn("Обзор…", self.choose_folder), mkbtn("📂", self.open_folder, "Открыть папку в Проводнике", w=36)), 1, 2)
         gl.addWidget(label("Громкость:"), 2, 0); gl.addLayout(hbox(self.chk_norm, (self.cb_norm, 1)), 2, 1, 1, 2)
+        gl.addWidget(label("Ключ ElevenLabs:"), 3, 0); gl.addWidget(self.ed_el_key, 3, 1); gl.addWidget(self.btn_el_eye, 3, 2)
+        gl.addWidget(self.lbl_el_acc, 4, 1, 1, 2)
         gl.setColumnStretch(1, 1); L.addWidget(g)
         L.addWidget(self._sec_voice()); L.addWidget(self._sec_el()); L.addWidget(self._sec_text(), 1)
         self._make_gen_btn(); L.addWidget(self.btn_gen)
@@ -1556,6 +1617,12 @@ class MainWindow(QMainWindow):
         self.ed_key.editingFinished.connect(self.save_cfg)
         self.btn_eye = eye = QToolButton(); eye.setText("👁"); eye.setCheckable(True); eye.setToolTip("Показать / скрыть ключ")
         eye.toggled.connect(lambda on: self.ed_key.setEchoMode(QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password))
+        self.lbl_el_acc = label("", "pagesub", wrap=True)
+        self.ed_el_key = QLineEdit(); self.ed_el_key.setEchoMode(QLineEdit.EchoMode.Password); self.ed_el_key.setPlaceholderText("необязательно: свой ключ ElevenLabs")
+        self.ed_el_key.setToolTip("С ним в списке моделей появятся модели ElevenLabs, которые работают напрямую с вашим аккаунтом, без OpenRouter")
+        self.ed_el_key.editingFinished.connect(self._el_key_changed)
+        self.btn_el_eye = QToolButton(); self.btn_el_eye.setText("👁"); self.btn_el_eye.setCheckable(True); self.btn_el_eye.setToolTip("Показать / скрыть ключ")
+        self.btn_el_eye.toggled.connect(lambda on: self.ed_el_key.setEchoMode(QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password))
         self.ed_folder = QLineEdit(); self.ed_folder.setPlaceholderText("Не выбрана — например C:/Projects/Video1/Audio")
         self.ed_folder.editingFinished.connect(self.save_cfg)
         self.chk_norm = QCheckBox("Нормализовать при сохранении")
@@ -1672,7 +1739,7 @@ class MainWindow(QMainWindow):
     # ---------- config
     def _apply_config(self):
         c = self.cfg
-        self.ed_key.setText(c.get("api_key", "") or os.environ.get("OPENROUTER_API_KEY", "")); self.ed_folder.setText(c.get("export_folder") or str(default_export_dir()))
+        self.ed_key.setText(c.get("api_key", "") or os.environ.get("OPENROUTER_API_KEY", "")); self.ed_el_key.setText(c.get("el_api_key", "")); self.ed_folder.setText(c.get("export_folder") or str(default_export_dir()))
         for s, k in ((self.sl_stab, "stability"), (self.sl_sim, "similarity"), (self.sl_style, "style"), (self.sl_speed, "speed")):
             if isinstance(c.get(k), (int, float)): s.setValue(round(c[k] * 100))
         i = self.cb_lang.findText(c.get("language", "ru")); self.cb_lang.setCurrentIndex(max(i, 0))
@@ -1695,7 +1762,7 @@ class MainWindow(QMainWindow):
         if self._loading: return
         self.cfg.update(normalize=self.chk_norm.isChecked(), norm_target=self.cb_norm.currentData(), profiles=self.profiles,
                         active_profile=self.active_profile, character=self.cur_character)
-        self.cfg.update(api_key=self.ed_key.text().strip(), export_folder=self.ed_folder.text().strip(), model=self.wanted_model,
+        self.cfg.update(api_key=self.ed_key.text().strip(), el_api_key=self.ed_el_key.text().strip(), export_folder=self.ed_folder.text().strip(), model=self.wanted_model,
                         voice=self.voice(), custom_voices=self.custom_voices, theme=CURRENT_THEME, language=self.cb_lang.currentText(), seed=self.ed_seed.text().strip(),
                         extended=self.chk_ext.isChecked(), autoplay=self.player.autoplay.isChecked(), custom_tags=self.custom_tags,
                         geometry=bytes(self.saveGeometry().toHex()).decode(), splitter=bytes(self.splitter.saveState().toHex()).decode(),
@@ -1744,10 +1811,42 @@ class MainWindow(QMainWindow):
         for mid in order:
             nm = str(models[mid].get("name") or mid); star = "★ " if mid in PRIORITY_MODELS else ""
             self.cb_model.addItem(f"{star}{nm}   [{mid}]" if nm != mid else f"{star}{mid}", mid)
+        if self.ed_el_key.text().strip():
+            for mid, nm in EL_MODELS: self.cb_model.addItem(f"◆ {nm}   [ElevenLabs, свой ключ]", f"el:{mid}")
         i = self.cb_model.findData(self.wanted_model)
         self.cb_model.setCurrentIndex(i if i >= 0 else 0); self.cb_model.blockSignals(False); self.on_model_changed()
 
     def _on_model_user(self): self.wanted_model = self.model(); self.on_model_changed()
+
+    def _el_key_changed(self):
+        self.save_cfg(); self.refresh_key_banner(); self.el_voices, self.el_ids, self.el_acc = [], {}, {}
+        self._fill_models(self.models); self.fetch_el_account()
+
+    def fetch_el_account(self):
+        key = self.ed_el_key.text().strip()
+        if not key: self.el_state = "none"; return self._el_acc_text()
+        self.el_state = "loading"; self._el_acc_text(); self._start(ElAccountWorker(key), self._on_el_account, self._on_el_account_fail)
+
+    def _on_el_account(self, d):
+        self.el_state, self.el_acc, self.el_voices = "ok", d, d["voices"]
+        self.el_ids = {v["name"].lower(): v["id"] for v in d["voices"]}
+        self.el_ids.update({re.split(r"[\s\-–(,]", k, maxsplit=1)[0]: i for k, i in list(self.el_ids.items()) if k})  # «George - Warm…» → george
+        self.en_previews.update({v["name"].lower(): v["url"] for v in d["voices"] if v["url"]})
+        if self.model().startswith("el:"): self.on_model_changed()
+        self._el_acc_text(); self.update_cost()
+
+    def _on_el_account_fail(self, msg): self.el_state = "failed"; self._el_acc_text(msg); self.status(msg.splitlines()[0], 15000)
+
+    def _el_acc_text(self, err=""):
+        a, s = self.el_acc, self.el_state
+        if s == "ok" and isinstance(a.get("limit"), int) and isinstance(a.get("used"), int):
+            t = f"Аккаунт подключён: голосов {len(self.el_voices)}, осталось кредитов {a['limit'] - a['used']:,} из {a['limit']:,}".replace(",", " ")
+        else: t = {"none": "", "loading": "Проверяю ключ…", "ok": f"Аккаунт подключён: голосов {len(self.el_voices)}"}.get(s, err.splitlines()[0] if err else "Ключ не проверен")
+        self.lbl_el_acc.setText(t)
+
+    def el_voice_id(self, voice):
+        v = str(voice).strip()
+        return self.el_ids.get(v.lower()) or (v if re.fullmatch(r"[A-Za-z0-9]{20}", v) else "")
 
     def on_model_changed(self):
         mid = self.model(); self.voice_list = self.voices_for_model(mid); want = self.wanted_voice
@@ -1755,16 +1854,16 @@ class MainWindow(QMainWindow):
         if match: self.cur_voice = match
         elif want and want in self.custom_voices: self.cur_voice = want
         else: self.cur_voice = next((v for v in self.voice_list if v.lower() == "george"), self.voice_list[0] if self.voice_list else want)
-        is_el = mid.startswith("elevenlabs/"); self.el_box.setEnabled(is_el)
-        self.grp_el.setTitle("Настройки ElevenLabs" if is_el else "Настройки ElevenLabs (недоступны для этой модели — активна только скорость)")
+        el = is_el(mid); self.el_box.setEnabled(el)
+        self.grp_el.setTitle("Настройки ElevenLabs" if el else "Настройки ElevenLabs (недоступны для этой модели — активна только скорость)")
         self.update_cost(); self.update_voice_ui()
 
     def voices_for_model(self, mid):
         """Полный список supported_voices из API; для elevenlabs/* — объединение с VOICE_DB. Ничего не отбрасывается."""
         api = norm_voices(self.models.get(mid, {}).get("supported_voices"))
-        if not mid.startswith("elevenlabs/"): return api or list(DEFAULT_VOICES)
+        if not is_el(mid): return api or list(DEFAULT_VOICES)
         out, seen = [], set()
-        for v in api + list(VOICE_DB):
+        for v in api + ([v["name"] for v in self.el_voices] if mid.startswith("el:") else []) + list(VOICE_DB):
             if v.lower() not in seen: seen.add(v.lower()); out.append(v)
         return out
 
@@ -1841,6 +1940,10 @@ class MainWindow(QMainWindow):
 
     def update_cost(self):
         n, mid = len(self.txt.toPlainText()), self.model(); rate = 40 if "turbo" in mid else 80
+        if mid.startswith("el:"):
+            a = self.el_acc; left = a["limit"] - a["used"] if isinstance(a.get("limit"), int) and isinstance(a.get("used"), int) else None
+            return self.lbl_cost.setText(f"Символов: <b>{n}</b> &nbsp;·&nbsp; Кредиты списывает ElevenLabs по тарифу модели"
+                                         + (f" &nbsp;·&nbsp; осталось <b style='color:{th()['accent']}'>{left:,}</b>".replace(",", " ") if left is not None else ""))
         note = "" if mid.startswith("elevenlabs/") else ", оценка"
         self.lbl_cost.setText(f"Символов: <b>{n}</b> &nbsp;·&nbsp; Стоимость: <b style='color:{th()['accent']}'>~${n * rate / 1e6:.4f}</b> &nbsp;(${rate}/1M симв.{note})")
 
@@ -1852,7 +1955,7 @@ class MainWindow(QMainWindow):
     def _on_el_fail(self, _msg): self.en_state = "failed"  # api.elevenlabs.io часто недоступен без VPN — хватает VOICE_DB
 
     def en_url(self, voice, model=None):
-        if not (model or self.model()).startswith("elevenlabs/"): return ""
+        if not is_el(model or self.model()): return ""
         v = str(voice).lower(); return VOICE_DB.get(v, {}).get("url") or self.en_previews.get(v, "")
 
     def preview_en(self, voice=None, btn=None):
@@ -1871,16 +1974,16 @@ class MainWindow(QMainWindow):
         model, voice, btn = self.model(), voice or self.voice(), btn or self.btn_ru; path = self.ru_path(model, voice)
         if not voice: return
         if path.is_file(): self.status("RU-превью из кэша — бесплатно"); return self.player.play_file(path, f"RU-превью · {voice} · {model}")
-        key = self.ed_key.text().strip()
-        if not key: return self._need_key("Введите API-ключ OpenRouter, чтобы сгенерировать RU-превью.")
         p = {**self.current_params(), "seed": "", "previous_text": "", "next_text": "", "language": "ru"}
+        worker, err = self._paid_worker(model, RU_PREVIEW_TEXT, voice, p, path)
+        if err: return self._route_error(err)
         set_busy(btn, True); self.status(f"Генерация RU-превью голоса {voice}…")
         def done(pth, note):
             set_busy(btn, False); self.update_ru_dot(); self.status(note or "RU-превью сохранено в voice_previews/ навсегда")
             if on_done: on_done()
             self.player.play_file(pth, f"RU-превью · {voice} · {model}")
         def fail(m): set_busy(btn, False); QMessageBox.critical(QApplication.activeWindow() or self, "Ошибка RU-превью", m)
-        self._start(TTSWorker(key, build_payload(model, RU_PREVIEW_TEXT, voice, p, p["extended"]), path), done, fail)
+        self._start(worker, done, fail)
 
     # ---------- text tools
     def insert_tag(self, tag):
@@ -1910,29 +2013,49 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Seed", "Ни у одного дубля в кэше seed не задавался.\nElevenLabs не возвращает случайный seed — "
                                 "нажмите 🎲 перед генерацией, чтобы зафиксировать его и потом повторить удачный дубль.")
 
+    def _paid_worker(self, model, text, voice, p, out):
+        """Платная генерация: модели «el:» идут напрямую в ElevenLabs своим ключом, остальные через OpenRouter. Возвращает (поток, ошибка)."""
+        if model.startswith("el:"):
+            key = self.ed_el_key.text().strip()
+            if not key: return None, ("el_key", "Введите свой API-ключ ElevenLabs.")
+            vid = self.el_voice_id(voice)
+            if not vid:
+                if self.el_state == "loading": return None, ("msg", "Список голосов ElevenLabs ещё загружается, попробуйте через пару секунд.")
+                return None, ("msg", f"Голос «{voice}» не найден в вашем аккаунте ElevenLabs. Выберите голос из списка или введите его ID (20 символов).")
+            return ElevenLabsWorker(key, vid, model[3:], text, p, out), None
+        key = self.ed_key.text().strip()
+        if not key: return None, ("key", "Введите API-ключ OpenRouter (sk-or-…).")
+        return TTSWorker(key, build_payload(model, text, voice, p, p["extended"]), out), None
+
+    def _route_error(self, err):
+        kind, msg = err
+        if kind == "msg": return QMessageBox.warning(QApplication.activeWindow() or self, "ElevenLabs", msg)
+        self._need_key(msg, kind == "el_key")
+
     # ---------- generation
     def generate(self):
         if self.pages.currentIndex() == 1: return self.free.generate()
         if self.gen_timer.isActive(): return
-        key, model, voice, text = self.ed_key.text().strip(), self.model(), self.voice(), self.txt.toPlainText().strip()
-        if not key: return self._need_key("Введите API-ключ OpenRouter (sk-or-…).")
+        model, voice, text = self.model(), self.voice(), self.txt.toPlainText().strip()
         if not text: self.txt.setFocus(); return QMessageBox.warning(self, "Нет текста", "Введите текст для озвучки.")
         if not model or not voice: return QMessageBox.warning(self, "Модель / голос", "Выберите модель и голос.")
         p = self.current_params(); out = CACHE_DIR / f"take_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.mp3"
         meta = {"id": uuid.uuid4().hex, "created": time.time(), "file": out.name, "text": text, "model": model, "voice": voice,
                 "params": p, "saved": False, "exported_name": "", "exported_path": "",
                 "character": self.cur_character if self.get_character(self.cur_character) else ""}
+        worker, err = self._paid_worker(model, text, voice, p, out)
+        if err: return self._route_error(err)
         self.gen_started = time.time(); self.gen_timer.start(); self._tick(); self.btn_gen.setEnabled(False)
-        self.status(f"Генерация: {model} · {voice} · {len(text)} симв.", 0); self.save_cfg()
-        self._start(TTSWorker(key, build_payload(model, text, voice, p, p["extended"]), out),
-                    lambda _p, note: self._on_take_ready(meta, note), self._on_gen_fail)
+        self.status(f"Генерация: {model_title(model)} · {voice} · {len(text)} симв.", 0); self.save_cfg()
+        self._start(worker, lambda _p, note: self._on_take_ready(meta, note), self._on_gen_fail)
 
-    def _need_key(self, msg):
-        if UI_MODE == "modern" and not self.settings.isVisible() and QApplication.activeWindow() is self: self.settings.open_page("Ключ"); self.ed_key.setFocus(); return
-        self.ed_key.setFocus(); QMessageBox.warning(QApplication.activeWindow() or self, "Нет API-ключа", msg)
+    def _need_key(self, msg, el=False):
+        field = self.ed_el_key if el else self.ed_key
+        if UI_MODE == "modern" and not self.settings.isVisible() and QApplication.activeWindow() is self: self.settings.open_page("Ключ"); field.setFocus(); return
+        field.setFocus(); QMessageBox.warning(QApplication.activeWindow() or self, "Нет API-ключа", msg)
 
     def refresh_key_banner(self):
-        if self.banner: self.banner.setVisible(not self.ed_key.text().strip())
+        if self.banner: self.banner.setVisible(not self.ed_key.text().strip() and not self.ed_el_key.text().strip())
 
     def _tick(self):
         self.btn_gen.setText(f"⏳  ГЕНЕРАЦИЯ…  {int(time.time() - self.gen_started)} с")
@@ -1950,6 +2073,7 @@ class MainWindow(QMainWindow):
         self.status(note or f"Готово за {time.time() - self.gen_started:.1f} с → {meta['file']}", 15000)
         self.list_scroll.verticalScrollBar().setValue(0); card.ed_name.setFocus(); card.ed_name.selectAll()
         if self.player.autoplay.isChecked(): self.play_take(meta)
+        if meta["model"].startswith("el:"): self.fetch_el_account()  # обновить остаток кредитов
 
     # ---------- takes
     def add_card(self, take):
@@ -1960,7 +2084,7 @@ class MainWindow(QMainWindow):
 
     def load_take(self, t):
         p = t.get("params", {}); self.txt.setPlainText(t.get("text", "")); self.wanted_voice = t.get("voice", "")
-        if self.cb_model.findData(t["model"]) < 0: self.cb_model.addItem(t["model"], t["model"])
+        if self.cb_model.findData(t["model"]) < 0: self.cb_model.addItem(model_title(t["model"]), t["model"])
         self.cb_model.setCurrentIndex(self.cb_model.findData(t["model"]))
         if t["voice"] not in self.voice_list and t["voice"] not in self.custom_voices: self.custom_voices.append(t["voice"])
         ch = self.get_character(t.get("character"))
