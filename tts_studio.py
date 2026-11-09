@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """TTS Studio — генерация озвучки через OpenRouter Audio Speech API (ElevenLabs v4 / v4-turbo)."""
-import base64, hashlib, html, json, os, random, re, shutil, struct, subprocess, sys, tempfile, time, traceback, uuid
+import base64, collections, hashlib, html, json, os, random, re, shutil, struct, subprocess, sys, tempfile, time, traceback, uuid, wave
 from pathlib import Path
 from string import Template
 import math
 import requests
-from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QUrl, QMimeData, QTimer, QRegularExpression, QByteArray, QPointF, QRectF, QEasingCurve,
+from PyQt6.QtCore import (Qt, QObject, QProcess, QProcessEnvironment, QThread, pyqtSignal, QUrl, QMimeData, QTimer, QRegularExpression, QByteArray, QPointF, QRectF, QEasingCurve,
                           QPropertyAnimation, QStandardPaths, QVariantAnimation)
 from PyQt6.QtGui import (QColor, QCursor, QDesktopServices, QDrag, QIcon, QImage, QKeySequence, QLinearGradient, QOpenGLContext, QPainter, QPainterPath,
                          QPalette, QPixmap, QRadialGradient, QShortcut, QRegularExpressionValidator, QVector2D, QVector3D)
-from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PyQt6.QtMultimedia import QAudioFormat, QAudioOutput, QAudioSource, QMediaDevices, QMediaPlayer
 from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFrame, QGraphicsDropShadowEffect,
                              QGraphicsOpacityEffect, QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
                              QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QRadioButton, QScrollArea, QSizePolicy,
@@ -26,7 +26,7 @@ try:  # нормализация громкости (numpy + miniaudio для д
 except Exception as _e:
     AUDIO_OK, AUDIO_ERR = False, f"{type(_e).__name__}: {_e}"
 
-APP_VERSION = "1.4.0"  # должна совпадать с git-тегом релиза (v1.0.0): это проверяет сборка в GitHub Actions
+APP_VERSION = "1.5.0"  # должна совпадать с git-тегом релиза (v1.0.0): это проверяет сборка в GitHub Actions
 RELEASE_API = "https://api.github.com/repos/FreeSize83/tts-studio/releases/latest"
 RELEASE_ASSET = "TTS-Studio.exe"
 FROZEN = getattr(sys, "frozen", False)
@@ -61,10 +61,12 @@ def move_files(src, dst, patterns):
     return errors
 
 CACHE_PATTERNS, PREVIEW_PATTERNS, FREE_PATTERNS = ("take_*.mp3", "takes_index.json"), ("en_*.mp3", "ru_*.mp3"), ("free_*.mp3", "free_index.json")
+LOCAL_PATTERNS = ("local_*.wav", "local_index.json", "ref_*.wav")
 CONFIG_PATH = home_dir() / "config.json"
 PREVIEW_DIR = home_dir() / "voice_previews"
 CACHE_DIR = home_dir() / "cache_takes"
 FREE_DIR = home_dir() / "free_takes"  # бесплатная генерация хранится отдельно от платной
+LOCAL_DIR = home_dir() / "local_takes"  # дубли локальной модели VoxCPM и образцы голоса
 INDEX_PATH = CACHE_DIR / "takes_index.json"
 PLAYBACK_FILES = (CACHE_DIR / "_active_playback.mp3", CACHE_DIR / "_active_playback_alt.mp3")
 
@@ -86,9 +88,10 @@ def init_config_path(app_dir=None):
     except OSError:
         if legacy.is_file(): CONFIG_PATH = legacy
 
-def set_dirs(cache=None, previews=None, free=None):
-    global CACHE_DIR, PREVIEW_DIR, FREE_DIR, INDEX_PATH, PLAYBACK_FILES
+def set_dirs(cache=None, previews=None, free=None, local=None):
+    global CACHE_DIR, PREVIEW_DIR, FREE_DIR, LOCAL_DIR, INDEX_PATH, PLAYBACK_FILES
     if free: FREE_DIR = Path(free)
+    if local: LOCAL_DIR = Path(local)
     if cache:
         CACHE_DIR = Path(cache); INDEX_PATH = CACHE_DIR / "takes_index.json"
         PLAYBACK_FILES = (CACHE_DIR / "_active_playback.mp3", CACHE_DIR / "_active_playback_alt.mp3")
@@ -97,7 +100,7 @@ def set_dirs(cache=None, previews=None, free=None):
 def resolve_dirs(cfg, app_dir=None):
     """Папка из настроек → старая папка рядом с программой → служебная. Недоступная (например, отключённый диск) пропускается."""
     app_dir = Path(app_dir or APP_DIR); desktop = app_on_desktop(app_dir); out, warn = [], []
-    for key, name in (("cache_dir", "cache_takes"), ("preview_dir", "voice_previews"), ("free_dir", "free_takes")):
+    for key, name in (("cache_dir", "cache_takes"), ("preview_dir", "voice_previews"), ("free_dir", "free_takes"), ("local_dir", "local_takes")):
         cands = [cfg.get(key), None if desktop or not (app_dir / name).is_dir() else app_dir / name, home_dir() / name]
         for i, c in enumerate(cands):
             if not c: continue
@@ -105,7 +108,7 @@ def resolve_dirs(cfg, app_dir=None):
             except OSError:
                 if i == 0: warn.append(str(c))
         else: out.append(home_dir() / name)
-    set_dirs(out[0], out[1], out[2]); return warn
+    set_dirs(out[0], out[1], out[2], out[3]); return warn
 
 UI_SCALE = 1.0  # итоговый масштаб интерфейса этого запуска
 SCALE_CHOICES = (("Авто (под монитор)", "auto"), ("80%", .8), ("90%", .9), ("100%", 1.0), ("110%", 1.1), ("125%", 1.25), ("150%", 1.5))
@@ -235,9 +238,9 @@ def auto_name(text, n=4):
     t = re.sub(r"\[[^\]]*\]", " ", (text or "").replace("\u0301", ""))
     return sanitize_filename("_".join(re.findall(r"\w+", t)[:n]).lower()[:60]) or time.strftime("take_%H%M%S")
 
-def unique_path(folder, base):
-    p, i = folder / f"{base}.mp3", 2
-    while p.exists(): p, i = folder / f"{base}_v{i}.mp3", i + 1
+def unique_path(folder, base, ext=".mp3"):
+    p, i = folder / f"{base}{ext}", 2
+    while p.exists(): p, i = folder / f"{base}_v{i}{ext}", i + 1
     return p
 
 def norm_voices(v):
@@ -340,13 +343,21 @@ def norm_settings(cfg):
 
 def loudness_group(lufs, quiet, loud): return "quiet" if lufs < quiet else "loud" if lufs > loud else "medium"
 
+def decode_native(data, fmt):
+    """Декодирует аудио в его собственной частоте и числе каналов: иначе miniaudio приводит всё к 44,1 кГц стерео."""
+    ch, sr = 2, 44100
+    for probe in (miniaudio.wav_get_info, miniaudio.mp3_get_info, miniaudio.flac_get_info, miniaudio.vorbis_get_info):
+        try: i = probe(data); ch, sr = min(max(int(i.nchannels), 1), 2), int(i.sample_rate); break
+        except Exception: continue
+    return miniaudio.decode(data, output_format=fmt, nchannels=ch, sample_rate=sr)
+
 def measure_lufs(src):
-    d = miniaudio.decode(Path(src).read_bytes(), output_format=miniaudio.SampleFormat.FLOAT32)
+    d = decode_native(Path(src).read_bytes(), miniaudio.SampleFormat.FLOAT32)
     return integrated_lufs(np.frombuffer(d.samples, dtype=np.float32).astype(np.float64).reshape(-1, d.nchannels), d.sample_rate)
 
 def normalize_mp3(src, dst, target=-16.0, ceiling=PEAK_CEILING, bitrate=192, max_gain=20.0):
-    """Декодирует MP3, приводит к целевой громкости (LUFS) с мягким лимитером на потолке пика и кодирует обратно в MP3."""
-    d = miniaudio.decode(Path(src).read_bytes(), output_format=miniaudio.SampleFormat.FLOAT32)
+    """Декодирует файл, приводит к целевой громкости (LUFS) с мягким лимитером на потолке пика и сохраняет в MP3 или WAV (по расширению dst)."""
+    d = decode_native(Path(src).read_bytes(), miniaudio.SampleFormat.FLOAT32)
     ch, fs = d.nchannels, d.sample_rate; x = np.frombuffer(d.samples, dtype=np.float32).astype(np.float64).reshape(-1, ch)
     before = integrated_lufs(x, fs); ceil_lin = 10 ** (ceiling / 20); gain = 0.0 if before <= -70 else min(target - before, max_gain)
     y, limited = _soft_limit(x * 10 ** (gain / 20), ceil_lin, fs); after = integrated_lufs(y, fs)
@@ -354,9 +365,13 @@ def normalize_mp3(src, dst, target=-16.0, ceiling=PEAK_CEILING, bitrate=192, max
         if before <= -70 or abs(after - target) < 0.15 or gain >= max_gain: break
         gain = min(gain + target - after, max_gain); y, limited = _soft_limit(x * 10 ** (gain / 20), ceil_lin, fs); after = integrated_lufs(y, fs)
     pcm = (np.clip(y, -1, 1) * 32767).round().astype("<i2").tobytes()
-    enc = lameenc.Encoder(); enc.set_bit_rate(bitrate); enc.set_in_sample_rate(fs); enc.set_channels(ch); enc.set_quality(2)
-    data = enc.encode(pcm) + enc.flush(); dst = Path(dst); tmp = dst.with_name(dst.name + ".part")
-    tmp.write_bytes(data); os.replace(tmp, dst)
+    dst = Path(dst); tmp = dst.with_name(dst.name + ".part")
+    if dst.suffix.lower() == ".wav":
+        with wave.open(str(tmp), "wb") as w: w.setnchannels(ch); w.setsampwidth(2); w.setframerate(fs); w.writeframes(pcm)
+    else:
+        enc = lameenc.Encoder(); enc.set_bit_rate(bitrate); enc.set_in_sample_rate(fs); enc.set_channels(ch); enc.set_quality(2)
+        tmp.write_bytes(enc.encode(pcm) + enc.flush())
+    os.replace(tmp, dst)
     return {"before": before, "after": after, "gain": gain, "limited": limited}
 
 # ---------------------------------------------------------------- app icon (рисуется кодом — без внешних файлов)
@@ -805,6 +820,7 @@ class AudioPlayer(QFrame):
         if not src.is_file(): return self.status(f"Файл не найден: {src.name}")
         self.release(); dst = None
         for cand in PLAYBACK_FILES:
+            cand = cand.with_suffix(src.suffix.lower() or ".mp3")  # копия сохраняет формат: локальные дубли — WAV
             try: shutil.copyfile(src, cand); dst = cand; break
             except OSError: continue
         if not dst: return self.status("Не удалось подготовить файл для воспроизведения (файл занят?)")
@@ -818,7 +834,7 @@ class AudioPlayer(QFrame):
 class TakeCard(QFrame):
     play = pyqtSignal(object); load = pyqtSignal(object); save = pyqtSignal(object); delete = pyqtSignal(object)
     def __init__(self, take):
-        super().__init__(); self.take = take; self.setObjectName("card"); p = {} if take.get("free") else take.get("params", {})
+        super().__init__(); self.take = take; self.setObjectName("card"); p = {} if take.get("free") or take.get("kind") else take.get("params", {})
         ts = time.strftime("%d.%m.%Y  %H:%M:%S", time.localtime(take.get("created", 0)))
         char = take.get("character") or ""
         head = hbox(label(f"<b>{ts}</b>"), label(esc(model_title(take.get("model", ""))), "chip"), label(f"🎤 {esc(take.get('voice', ''))}", "chip" if char else "chipacc"),
@@ -826,7 +842,7 @@ class TakeCard(QFrame):
         meta = f"Stab {p.get('stability', 0):.2f} · Sim {p.get('similarity', 0):.2f} · Style {p.get('style', 0):.2f} · " \
                f"Speed {p.get('speed', 1):.2f} · Seed {p.get('seed') or '—'} · Lang {p.get('language', '—')}"
         if not is_el(take.get("model", "")) or not p.get("extended", True): meta += " · базовые параметры"
-        if take.get("free"): meta = take.get("meta", "")
+        if take.get("free") or take.get("kind"): meta = take.get("meta", "")
         if p.get("fallback"): meta += " · ⚠ без расширенных (fallback)"
         text = take.get("text", "")
         txt = ClickLabel(text if len(text) <= 420 else text[:420] + "…"); txt.setObjectName("taketext")
@@ -1124,7 +1140,7 @@ def gemini_audio(p):
     return base64.b64decode(audio[-1])
 
 def audio_bytes_to_mp3(data, dst, bitrate=192):
-    d = miniaudio.decode(data, output_format=miniaudio.SampleFormat.SIGNED16)
+    d = decode_native(data, miniaudio.SampleFormat.SIGNED16)
     enc = lameenc.Encoder(); enc.set_bit_rate(bitrate); enc.set_in_sample_rate(d.sample_rate); enc.set_channels(d.nchannels); enc.set_quality(2)
     dst = Path(dst); tmp = dst.with_name(dst.name + ".part"); tmp.write_bytes(enc.encode(d.samples.tobytes()) + enc.flush()); os.replace(tmp, dst)
 
@@ -1303,6 +1319,711 @@ class FreeTab(QWidget):
         try: save_json(FREE_DIR / "free_index.json", self.takes)
         except OSError as e: self.owner.status(f"Не удалось сохранить список бесплатных дублей: {e}")
 
+VOXCPM_WORKER = r'''# -*- coding: utf-8 -*-
+"""Фоновый процесс TTS Studio для локальной модели VoxCPM (https://github.com/OpenBMB/VoxCPM, Apache-2.0).
+
+Запускается интерпретатором из отдельного окружения с PyTorch. Команды приходят строками JSON в stdin,
+ответы уходят в stdout строками с префиксом @@TTS@@; всё остальное, что печатают библиотеки, идёт в stderr как журнал.
+"""
+import gc, json, os, re, sys, threading, time, traceback
+
+PREFIX = "@@TTS@@"
+_proto = sys.stdout
+for _s in (sys.stdin, _proto, sys.stderr):
+    try: _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception: pass
+sys.stdout = sys.stderr  # print() библиотек не должен ломать протокол
+_lock = threading.Lock()
+
+def emit(**kw):
+    with _lock:
+        _proto.write(PREFIX + json.dumps(kw, ensure_ascii=False) + "\n"); _proto.flush()
+
+def watch_parent(pid):
+    """Если программа закрылась или упала, процесс модели не должен остаться висеть с занятой видеопамятью.
+    Команды читает только главный поток между задачами: в Windows чтение stdin в отдельном потоке подвешивает импорт PyTorch."""
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32; k32.OpenProcess.restype = ctypes.c_void_p; k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        h = k32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+        if not h: os._exit(0)
+        k32.WaitForSingleObject(h, 0xFFFFFFFF); os._exit(0)
+    except Exception: pass
+
+ASR_MODEL = "iic/SenseVoiceSmall"
+DENOISER_MODEL = "iic/speech_zipenhancer_ans_multiloss_16k_base"
+state = {"model": None, "key": None, "asr": None}
+
+def vram():
+    try:
+        import torch
+        if torch.cuda.is_available():
+            free, total = torch.cuda.mem_get_info(); return [round((total - free) / 2 ** 30, 1), round(total / 2 ** 30, 1)]
+    except Exception: pass
+    return None
+
+def patch_torchaudio():
+    """torchaudio 2.9+ читает и пишет файлы через torchcodec, которому нужны библиотеки FFmpeg. Здесь только WAV, хватает soundfile."""
+    import soundfile as sf, torch, torchaudio
+    def load(path, *a, **k):
+        data, sr = sf.read(str(path), dtype="float32", always_2d=True); return torch.from_numpy(data.T.copy()), sr
+    def save(path, tensor, sr, *a, **k):
+        sf.write(str(path), tensor.detach().cpu().numpy().T, int(sr))
+    torchaudio.load, torchaudio.save = load, save
+
+def free_model():
+    state["model"] = None; state["key"] = None; gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+    except Exception: pass
+
+def do_load(c):
+    key = (c["model"], c.get("device") or "auto", c.get("lora") or "", bool(c.get("optimize")))
+    if state["model"] is None or state["key"] != key:
+        free_model(); t0 = time.time()
+        import torch, voxcpm
+        from voxcpm.model.utils import resolve_runtime_device
+        patch_torchaudio()
+        device = resolve_runtime_device(key[1], "cuda")
+        emit(ev="status", msg=f"Загружаю модель {key[0]} на {device}…")
+        state["model"] = voxcpm.VoxCPM.from_pretrained(key[0], load_denoiser=False, optimize=key[3] and device.startswith("cuda"), device=device,
+                                                       lora_weights_path=key[2] or None)
+        state["key"] = key; state["device"] = device; state["load_s"] = round(time.time() - t0, 1)
+        state["gpu"] = torch.cuda.get_device_name(0) if device.startswith("cuda") else ""
+    m = state["model"].tts_model
+    emit(ev="loaded", model=key[0], device=state["device"], gpu=state["gpu"], sr=int(m.sample_rate), dtype=str(getattr(getattr(m, "config", None), "dtype", "")),
+         lora=key[2], v2=type(m).__name__ == "VoxCPM2Model", secs=state["load_s"], vram=vram())
+
+def do_generate(c):
+    model = state["model"]
+    if model is None: raise RuntimeError("Модель не загружена")
+    import numpy as np, soundfile as sf
+    text = (c.get("text") or "").strip()
+    if not text: raise ValueError("Пустой текст")
+    # как в app.py оригинала: скобки из описания убираются, само описание идёт в скобках перед текстом
+    control = re.sub(r"[()（）]", "", (c.get("control") or "")).strip()
+    ref = c.get("ref") or None; prompt_text = (c.get("prompt_text") or "").strip() or None
+    if prompt_text and ref: control = ""  # режим точного клонирования отключает описание
+    kw = dict(text=f"({control}){text}" if control else text, reference_wav_path=ref, cfg_value=float(c.get("cfg", 2.0)),
+              inference_timesteps=int(c.get("steps", 10)), normalize=bool(c.get("normalize")), denoise=bool(c.get("denoise")) and bool(ref), seed=c.get("seed"))
+    if type(model.tts_model).__name__ != "VoxCPM2Model":  # VoxCPM 1.x умеет только продолжение по образцу с текстом
+        kw.pop("reference_wav_path")
+        if ref and not prompt_text: raise ValueError("Эта модель клонирует голос только в режиме точного клонирования: нужен текст образца.")
+    if prompt_text and ref: kw["prompt_wav_path"] = ref; kw["prompt_text"] = prompt_text
+    if kw["denoise"] and model.denoiser is None:
+        emit(ev="status", msg="Загружаю шумоподавление ZipEnhancer…")
+        from voxcpm.zipenhancer import ZipEnhancer
+        model.denoiser = ZipEnhancer(DENOISER_MODEL)
+    import inspect
+    seed = kw["seed"]
+    if "seed" not in inspect.signature(model._generate).parameters:  # в выпуске voxcpm 2.0.3 параметра seed ещё нет: задаём зерно сами
+        kw.pop("seed")
+        if seed is not None:
+            import random, torch
+            random.seed(seed); np.random.seed(seed % 2 ** 32); torch.manual_seed(seed)
+            if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+    t0 = time.time(); emit(ev="status", msg="Генерирую…")
+    wav = model.generate(**kw)
+    wav = np.asarray(wav, dtype=np.float32).reshape(-1); sr = int(model.tts_model.sample_rate)
+    out = c["out"]; tmp = out + ".part"; sf.write(tmp, wav, sr, format="WAV", subtype="PCM_16"); os.replace(tmp, out)
+    emit(ev="done", id=c.get("id"), out=out, sr=sr, audio_s=round(len(wav) / sr, 2), secs=round(time.time() - t0, 1),
+         seed=getattr(model.tts_model, "last_successful_seed", None) or seed, vram=vram())
+
+def do_asr(c):
+    if state["asr"] is None:
+        emit(ev="status", msg="Загружаю распознавание речи SenseVoice…")
+        from funasr import AutoModel
+        state["asr"] = AutoModel(model=ASR_MODEL, disable_update=True, device="cpu")  # на процессоре: память видеокарты нужна самой модели
+    res = state["asr"].generate(input=c["wav"], language="auto", use_itn=True)
+    emit(ev="asr", id=c.get("id"), text=res[0]["text"].split("|>")[-1].strip())
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1].isdigit(): threading.Thread(target=watch_parent, args=(int(sys.argv[1]),), daemon=True).start()
+    emit(ev="hello", pid=os.getpid(), python=sys.version.split()[0])
+    handlers = {"load": do_load, "generate": do_generate, "asr": do_asr, "unload": lambda c: (free_model(), emit(ev="unloaded", vram=vram()))}
+    while True:
+        line = sys.stdin.readline()
+        if not line: os._exit(0)  # программа закрыла канал
+        try: c = json.loads(line)
+        except ValueError: continue
+        if c.get("cmd") in ("quit", "abort"): os._exit(0)  # без долгой выгрузки библиотек
+        try: handlers[c["cmd"]](c)
+        except BaseException as e:
+            if isinstance(e, (KeyboardInterrupt, SystemExit)): raise
+            msg = f"{type(e).__name__}: {e}"; oom = "out of memory" in msg.lower()
+            if oom: free_model()
+            emit(ev="error", where=c.get("cmd"), id=c.get("id"), msg=msg[:1500], oom=oom, trace=traceback.format_exc()[-3000:])
+
+if __name__ == "__main__":
+    main()
+'''
+
+# ---------------------------------------------------------------- локальная генерация (VoxCPM)
+VOXCPM_MODELS = (("openbmb/VoxCPM2", "VoxCPM2 · 30 языков, 48 кГц, около 8 ГБ видеопамяти"),
+                 ("openbmb/VoxCPM1.5", "VoxCPM 1.5 · только английский и китайский, около 6 ГБ"),
+                 ("openbmb/VoxCPM-0.5B", "VoxCPM 0.5B · только английский и китайский, около 5 ГБ"))
+VOXCPM_PKGS = {"torch": "2.10.0", "torchaudio": "2.10.0", "voxcpm": "2.0.3", "torchcodec": "0.10.0"}  # версии из uv.lock репозитория VoxCPM
+TORCH_INDEX, TORCH_INDEX_CPU = "https://download.pytorch.org/whl/cu128", "https://download.pytorch.org/whl/cpu"
+UV_URL = "https://github.com/astral-sh/uv/releases/download/0.12.8/uv-x86_64-pc-windows-msvc.zip"
+UV_SHA256 = "e07acf3f8a29fe41f9e04b799c3325cb0e0893836bb222bf102829b45c679ad6"
+VOXCPM_NEED_GB = 14
+WORKER_NAME = "tts_studio_worker.py"
+WORKER_PREFIX = "@@TTS@@"
+RUNTIME_PARTS = ("venv", "python", "uv-cache", "uv", "models", "tmp")  # всё, что установка создаёт в своей папке
+
+def default_voxcpm_root():
+    """Среда занимает около 14 ГБ, поэтому по умолчанию ставится на диск, где больше всего места, а не на системный."""
+    if os.environ.get("TTS_STUDIO_HOME"): return home_dir() / "voxcpm"
+    best, free = None, -1
+    try:
+        import ctypes
+        mask = ctypes.windll.kernel32.GetLogicalDrives()
+        for i in range(26):
+            d = f"{chr(65 + i)}:\\"
+            if mask >> i & 1 and ctypes.windll.kernel32.GetDriveTypeW(d) == 3:  # только несъёмные диски
+                try: f = shutil.disk_usage(d).free
+                except OSError: continue
+                if f > free: best, free = d, f
+    except Exception: pass
+    return Path(best or "C:\\") / "TTS Studio" / "VoxCPM"
+
+def voxcpm_python(root): return Path(root) / "venv" / "Scripts" / "python.exe"
+def voxcpm_ready(root): return voxcpm_python(root).is_file() and (Path(root) / "installed.json").is_file()
+
+def voxcpm_env(root):
+    """Кэши, модели и временные файлы остаются в папке среды: на системный диск ничего не пишется."""
+    root = Path(root); env = dict(os.environ)
+    env.update(UV_CACHE_DIR=str(root / "uv-cache"), UV_PYTHON_INSTALL_DIR=str(root / "python"), HF_HOME=str(root / "models" / "hf"),
+               MODELSCOPE_CACHE=str(root / "models" / "modelscope"), TEMP=str(root / "tmp"), TMP=str(root / "tmp"), PYTHONUTF8="1", PYTHONIOENCODING="utf-8",
+               PYTHONUNBUFFERED="1", TOKENIZERS_PARALLELISM="false", HF_HUB_DISABLE_SYMLINKS_WARNING="1")
+    for k in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV"): env.pop(k, None)
+    return env
+
+def qenv(d):
+    e = QProcessEnvironment()
+    for k, v in d.items(): e.insert(k, v)
+    return e
+
+def start_proc(p, prog, args):
+    """В собранном exe PyInstaller подменяет папку поиска DLL своей временной; дочерний Python должен получить обычную."""
+    k32 = None
+    if FROZEN and sys.platform == "win32":
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32; k32.SetDllDirectoryW(None)
+        except Exception: k32 = None
+    try: p.start(str(prog), [str(a) for a in args])
+    finally:
+        if k32: k32.SetDllDirectoryW(getattr(sys, "_MEIPASS", None))
+
+def kill_tree(proc):
+    """python.exe в окружении — это загрузчик с дочерним процессом, поэтому завершается всё дерево."""
+    pid = proc.processId()
+    if pid and sys.platform == "win32":
+        try: subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=15)
+        except Exception: pass
+    proc.kill(); proc.waitForFinished(2000)
+
+def find_uv(root):
+    for c in (Path(root) / "uv" / "uv.exe", shutil.which("uv"), Path.home() / ".local" / "bin" / "uv.exe"):
+        if c and Path(c).is_file(): return str(c)
+    return ""
+
+class UvDownloadWorker(QThread):
+    """Скачивает установщик пакетов uv (официальный выпуск Astral) и сверяет его контрольную сумму."""
+    ok = pyqtSignal(str); fail = pyqtSignal(str)
+    def __init__(self, root): super().__init__(); self.root = Path(root)
+    def run(self):
+        try:
+            d = self.root / "uv"; d.mkdir(parents=True, exist_ok=True); r = requests.get(UV_URL, timeout=(15, 120)); r.raise_for_status()
+            if hashlib.sha256(r.content).hexdigest() != UV_SHA256: return self.fail.emit("Установщик uv скачался повреждённым: не совпала контрольная сумма.")
+            import io, zipfile
+            with zipfile.ZipFile(io.BytesIO(r.content)) as z: (d / "uv.exe").write_bytes(z.read("uv.exe"))
+            self.ok.emit(str(d / "uv.exe"))
+        except Exception as e: self.fail.emit(f"Не удалось скачать установщик uv: {type(e).__name__}: {e}")
+
+class RemoveWorker(QThread):
+    """Удаляет только то, что создала установка; посторонние файлы в папке остаются."""
+    ok = pyqtSignal(str); fail = pyqtSignal(str)
+    def __init__(self, root): super().__init__(); self.root = Path(root)
+    def run(self):
+        errors = []
+        for name in RUNTIME_PARTS: shutil.rmtree(self.root / name, onexc=lambda _f, p, e: errors.append(f"{p}: {e}")) if (self.root / name).is_dir() else None
+        for name in ("installed.json", WORKER_NAME):
+            try: (self.root / name).unlink(missing_ok=True)
+            except OSError as e: errors.append(str(e))
+        try: self.root.rmdir()  # только если папка опустела
+        except OSError: pass
+        self.fail.emit("Часть файлов удалить не удалось:\n" + "\n".join(errors[:5])) if errors else self.ok.emit("")
+
+class InstallRunner(QObject):
+    """Установка среды по шагам: каждый шаг — отдельный процесс, вывод идёт в журнал на вкладке."""
+    line = pyqtSignal(str); step = pyqtSignal(int, int, str); done = pyqtSignal(bool, str)
+    def __init__(self, root, parent=None):
+        super().__init__(parent); self.root = Path(root); self.proc = None; self.steps = []; self.i = -1; self.cancelled = False; self.ended = False; self.dl = None; self.tail = collections.deque(maxlen=12)
+    def start(self):
+        try:
+            for d in ("tmp", "models"): (self.root / d).mkdir(parents=True, exist_ok=True)
+        except OSError as e: return self._end(False, f"Не удалось создать папку:\n{e}")
+        uv = find_uv(self.root)
+        if uv: return self._plan(uv)
+        self.step.emit(0, 0, "Скачиваю установщик пакетов uv"); self.dl = UvDownloadWorker(self.root)
+        self.dl.ok.connect(self._plan); self.dl.fail.connect(lambda m: self._end(False, m)); self.dl.start()
+    def _plan(self, uv):
+        if self.cancelled: return
+        py = str(voxcpm_python(self.root)); gpu = bool(shutil.which("nvidia-smi")); V = VOXCPM_PKGS
+        self.steps = [("Создаю окружение Python", uv, ["venv", str(self.root / "venv"), "--python", "3.12", "--python-preference", "only-managed", "--allow-existing"]),
+                      ("Скачиваю PyTorch " + ("с поддержкой видеокарты, около 3 ГБ" if gpu else "для процессора"), uv,
+                       ["pip", "install", "--python", py, f"torch=={V['torch']}", f"torchaudio=={V['torchaudio']}", "--index-url", TORCH_INDEX if gpu else TORCH_INDEX_CPU]),
+                      ("Устанавливаю VoxCPM и зависимости", uv, ["pip", "install", "--python", py, f"voxcpm=={V['voxcpm']}", f"torchcodec=={V['torchcodec']}"]),
+                      ("Проверяю установку", py, ["-c", "import torch, voxcpm; print('torch', torch.__version__, '| видеокарта доступна:', torch.cuda.is_available())"]),
+                      ("Скачиваю модель VoxCPM2, около 5 ГБ", py, ["-c", "from huggingface_hub import snapshot_download; print(snapshot_download('openbmb/VoxCPM2'))"]),
+                      ("Убираю временные файлы", uv, ["cache", "clean"])]
+        self._next()
+    def _next(self):
+        self.i += 1
+        if self.cancelled: return
+        if self.i >= len(self.steps):
+            try: save_json(self.root / "installed.json", {"app": APP_VERSION, "time": time.time(), **VOXCPM_PKGS})
+            except OSError as e: return self._end(False, str(e))
+            return self._end(True, "")
+        title, prog, args = self.steps[self.i]; self.step.emit(self.i + 1, len(self.steps), title); self.tail.clear()
+        self.proc = p = QProcess(self); p.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels); p.setProcessEnvironment(qenv(voxcpm_env(self.root)))
+        p.readyReadStandardOutput.connect(self._read); p.finished.connect(self._finished); p.errorOccurred.connect(self._error); start_proc(p, prog, args)
+    def _read(self):
+        for part in re.split(r"[\r\n]+", bytes(self.proc.readAllStandardOutput()).decode("utf-8", "replace")):
+            if part.strip(): self.tail.append(part.strip()[:300]); self.line.emit(part.strip()[:300])
+    def _finished(self, code, _status):
+        if self.cancelled or self.ended: return
+        last = self.i == len(self.steps) - 1  # уборка кэша не должна ломать готовую установку
+        if code != 0 and not last: return self._end(False, f"Шаг «{self.steps[self.i][0]}» завершился с ошибкой (код {code}):\n\n" + "\n".join(self.tail))
+        self._next()
+    def _error(self, err):
+        if err == QProcess.ProcessError.FailedToStart and not self.cancelled: self._end(False, f"Не удалось запустить шаг «{self.steps[self.i][0]}».")
+    def _end(self, ok, msg):
+        if self.ended: return
+        self.ended = True; self.done.emit(ok, msg)
+    def cancel(self):
+        self.cancelled = True
+        if self.proc and self.proc.state() != QProcess.ProcessState.NotRunning: kill_tree(self.proc)
+
+class LocalTab(QWidget):
+    """Отдельная вкладка: модель VoxCPM работает на этом компьютере. Повторяет демо-приложение VoxCPM (app.py): дизайн голоса,
+    управляемое и точное клонирование, распознавание текста образца, шумоподавление, нормализация текста, CFG, шаги, seed."""
+    GEN_TEXT = "СГЕНЕРИРОВАТЬ НА ЭТОМ КОМПЬЮТЕРЕ  (Ctrl + Enter)"
+    DEVICES = (("Авто: видеокарта, если есть", "auto"), ("Видеокарта (CUDA)", "cuda"), ("Процессор (очень медленно)", "cpu"))
+    def __init__(self, owner):
+        super().__init__(); self.owner = owner; c = owner.cfg.get("local") if isinstance(owner.cfg.get("local"), dict) else {}
+        self.root = Path(owner.cfg.get("local_rt") or default_voxcpm_root()); self.proc = None; self.hello = False; self.runner = None; self.remover = None
+        self.jobs, self.cur, self.loaded, self.loading_key, self.info = [], None, None, None, {}
+        self.phase = "idle"  # idle | starting | loading | generating | asr | installing | removing
+        self.want_load = False; self.asr_req = None; self.stopping = False; self.started = 0.0; self.batch_total = self.batch_done = 0
+        self.log = collections.deque(maxlen=400); self.out_buf = b""; self.cards = {}
+        self.ref = c.get("ref", "") if c.get("ref") and Path(c["ref"]).is_file() else ""; self.ref_name = c.get("ref_name", "") if self.ref else ""
+        self.rec_src = self.rec_io = None; self.rec_buf = bytearray(); self.rec_fmt = None
+        self.takes = [t for t in load_json(LOCAL_DIR / "local_index.json", []) if isinstance(t, dict) and t.get("file")]
+        self.timer = QTimer(self); self.timer.setInterval(500); self.timer.timeout.connect(self._tick)
+        modern = UI_MODE == "modern"
+        # --- установка
+        self.ed_root = QLineEdit(str(self.root)); self.ed_root.setReadOnly(True); self.lbl_space = label("", "pagesub", wrap=True)
+        self.btn_install = mkbtn("Установить VoxCPM", self.install, obj="pickbtn"); self.btn_cancel = mkbtn("Отмена", self.cancel_install); self.btn_cancel.hide()
+        self.lbl_step = label("", "rowhead", wrap=True); self.install_log = QPlainTextEdit(); self.install_log.setReadOnly(True); self.install_log.setObjectName("logview")
+        self.install_log.setMaximumBlockCount(300); self.install_log.setFixedHeight(150); self.install_log.hide()
+        page_install = QWidget(); page_install.setLayout(vbox(
+            label("VoxCPM работает прямо на этом компьютере: без ключей и лимитов, а после установки и без интернета. Умеет создавать голос по описанию "
+                  "и клонировать голос по образцу. Нужна видеокарта NVIDIA с 8 ГБ памяти (на процессоре работает, но очень медленно) и около "
+                  f"{VOXCPM_NEED_GB} ГБ на диске. Установка скачивает PyTorch и модель и занимает 10–30 минут.", "pagesub", wrap=True),
+            hbox(label("Папка:"), (self.ed_root, 1), mkbtn("Выбрать…", self.pick_root)), self.lbl_space, hbox(self.btn_install, self.btn_cancel, 1), self.lbl_step, self.install_log, s=8))
+        page_install.layout().setContentsMargins(0, 0, 0, 0)
+        # --- модель
+        self.lbl_state = label("", "rowhead", wrap=True); self.lbl_vram = label("", "pagesub", wrap=True)
+        self.cb_model = QComboBox(); self.cb_device = QComboBox()
+        for mid, title in VOXCPM_MODELS: self.cb_model.addItem(title, mid)
+        for title, dev in self.DEVICES: self.cb_device.addItem(title, dev)
+        for cb, key in ((self.cb_model, "model"), (self.cb_device, "device")):
+            cb.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon); cb.setMinimumContentsLength(12); cb.setCurrentIndex(max(0, cb.findData(c.get(key))))
+        self.ed_lora = QLineEdit(c.get("lora", "")); self.ed_lora.setPlaceholderText("необязательно: папка или файл с дообученными весами LoRA")
+        self.chk_opt = QCheckBox("Ускорение torch.compile (экспериментально, нужен компилятор C++)"); self.chk_opt.setChecked(bool(c.get("optimize")))
+        self.btn_load = mkbtn("Загрузить модель", self.load_model, "Загрузить модель в память заранее. Иначе она загрузится при первой генерации")
+        self.btn_stop = mkbtn("Остановить и выгрузить", self.stop, "Прервать генерацию и освободить память видеокарты")
+        self.btn_log = mkbtn("Журнал", None, "Показать сообщения модели"); self.btn_log.setCheckable(True)
+        self.log_view = QPlainTextEdit(); self.log_view.setReadOnly(True); self.log_view.setObjectName("logview"); self.log_view.setMaximumBlockCount(400); self.log_view.setFixedHeight(140); self.log_view.hide()
+        self.btn_log.toggled.connect(self._toggle_log)
+        g = QGridLayout(); g.setContentsMargins(0, 0, 0, 0)
+        g.addWidget(label("Модель:"), 0, 0); g.addWidget(self.cb_model, 0, 1, 1, 3); g.addWidget(label("Устройство:"), 1, 0); g.addWidget(self.cb_device, 1, 1, 1, 3)
+        g.addWidget(label("LoRA:"), 2, 0); g.addWidget(self.ed_lora, 2, 1); g.addWidget(mkbtn("…", self.pick_lora, "Выбрать папку с весами LoRA", w=36), 2, 2)
+        g.addWidget(mkbtn("✕", lambda: self.ed_lora.clear(), "Убрать LoRA", w=36), 2, 3); g.setColumnStretch(1, 1)
+        page_main = QWidget(); page_main.setLayout(vbox(self.lbl_state, self.lbl_vram, g, self.chk_opt,
+                                                        hbox(self.btn_load, self.btn_stop, 1, self.btn_log, mkbtn("Удалить VoxCPM…", self.uninstall, "Удалить модель и окружение с диска")), self.log_view, s=6))
+        page_main.layout().setContentsMargins(0, 0, 0, 0)
+        g_eng = QGroupBox("Локальная модель VoxCPM"); self.stack = QStackedWidget(); self.stack.addWidget(page_install); self.stack.addWidget(page_main)
+        QVBoxLayout(g_eng).addWidget(self.stack)
+        # --- голос
+        g_voice = QGroupBox("Голос"); self.lbl_mode = label("", "pagesub", wrap=True); self.lbl_ref = label("", "rowhead"); self.lbl_ref.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.btn_rec = mkbtn("● Запись", None, "Записать образец с микрофона. Хватит 5–15 секунд чистой речи"); self.btn_rec.setCheckable(True); self.btn_rec.toggled.connect(self._toggle_rec)
+        self.chk_ultimate = QCheckBox("Точное клонирование: модель продолжает образец, нужен его текст"); self.chk_ultimate.setChecked(bool(c.get("ultimate")))
+        self.ed_prompt = QPlainTextEdit(c.get("prompt", "")); self.ed_prompt.setPlaceholderText("Текст, который звучит в образце. Кнопка «Распознать» заполнит его сама"); self.ed_prompt.setFixedHeight(58)
+        self.btn_asr = mkbtn("Распознать", self.run_asr, "Распознать текст образца (SenseVoice). Результат можно поправить вручную")
+        self.box_prompt = QWidget(); self.box_prompt.setLayout(hbox((self.ed_prompt, 1), self.btn_asr)); self.box_prompt.layout().setContentsMargins(0, 0, 0, 0)
+        self.ed_control = QLineEdit(c.get("control", "")); self.ed_control.setPlaceholderText("например: молодая женщина, тёплый голос, говорит быстро и радостно")
+        chips = QGridLayout(); chips.setSpacing(4)
+        for i, em in enumerate(FREE_EMOTIONS): chips.addWidget(mkbtn(em[0], lambda e=em: self.ed_control.setText(e[1]), "Подставить описание в поле «Описание»", "tag"), 0, i)
+        v = QVBoxLayout(g_voice); v.addWidget(self.lbl_mode)
+        v.addLayout(hbox(label("Образец:"), (self.lbl_ref, 1), mkbtn("Файл…", self.pick_ref, "Выбрать запись голоса: WAV, MP3, FLAC или OGG"), self.btn_rec,
+                         mkbtn("▶", self.play_ref, "Прослушать образец", w=36), mkbtn("✕", self.clear_ref, "Убрать образец", w=36)))
+        v.addWidget(self.chk_ultimate); v.addWidget(self.box_prompt); v.addLayout(hbox(label("Описание:"), (self.ed_control, 1))); v.addLayout(chips)
+        # --- настройки генерации
+        g_adv = QGroupBox("Настройки генерации"); ag = QGridLayout(g_adv)
+        self.chk_denoise = QCheckBox("Очистить образец от шума (ZipEnhancer)"); self.chk_denoise.setChecked(bool(c.get("denoise")))
+        self.chk_norm_text = QCheckBox("Нормализация текста: числа, даты, сокращения"); self.chk_norm_text.setChecked(bool(c.get("normalize")))
+        self.sl_cfg = owner._slider(ag, 2, "CFG", 1.0, 3.0, float(c.get("cfg", 2.0)), "Выше: ближе к описанию и образцу. Ниже: свободнее и разнообразнее")
+        self.sl_steps = QSlider(Qt.Orientation.Horizontal); self.sl_steps.setRange(1, 50); self.sl_steps.setValue(int(c.get("steps", 10)))
+        self.lbl_steps = label(str(self.sl_steps.value()), "sval"); self.lbl_steps.setFixedWidth(42); self.lbl_steps.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.sl_steps.valueChanged.connect(lambda x: self.lbl_steps.setText(str(x))); tip = "Шаги диффузии: больше шагов — возможно, лучше звук, но медленнее"; self.sl_steps.setToolTip(tip)
+        self.ed_seed = QLineEdit(str(c.get("seed", ""))); self.ed_seed.setValidator(QRegularExpressionValidator(QRegularExpression(r"\d{0,10}"), self))
+        self.chk_rand = QCheckBox("Случайный seed"); self.chk_rand.setChecked(c.get("random_seed", True)); self.chk_rand.toggled.connect(lambda on: self.ed_seed.setEnabled(not on))
+        self.ed_seed.setEnabled(not self.chk_rand.isChecked()); self.ed_seed.setToolTip("После генерации здесь появляется seed готового дубля: с ним результат можно повторить")
+        ag.addWidget(self.chk_denoise, 0, 0, 1, 3); ag.addWidget(self.chk_norm_text, 1, 0, 1, 3); ag.addWidget(label("Шаги", tip=tip), 3, 0); ag.addWidget(self.sl_steps, 3, 1); ag.addWidget(self.lbl_steps, 3, 2)
+        ag.addWidget(label("Seed"), 4, 0); ag.addLayout(hbox((self.ed_seed, 1), self.chk_rand), 4, 1, 1, 2); ag.setColumnStretch(1, 1)
+        # --- текст
+        g_txt = QGroupBox("Текст для локальной озвучки"); tv = QVBoxLayout(g_txt)
+        self.txt = TextEdit(); self.txt.setMinimumHeight(110); self.txt.setPlaceholderText("Введите текст…"); self.txt.setPlainText(c.get("text", "")); self.txt.submit.connect(self.generate)
+        self.chk_batch = QCheckBox("Каждая строка — отдельный дубль"); self.chk_batch.setChecked(bool(c.get("batch")))
+        self.chk_wav = QCheckBox("Сохранять в папку как WAV 48 кГц без сжатия"); self.chk_wav.setChecked(bool(c.get("save_wav"))); self.chk_wav.setToolTip("Иначе файл сохраняется в MP3, как на других вкладках")
+        self.lbl_count = label("", "cost"); self.txt.textChanged.connect(self._count); tv.addWidget(self.txt, 1); tv.addLayout(hbox(self.chk_batch, self.chk_wav, 1)); tv.addWidget(self.lbl_count)
+        self.btn_gen = mkbtn(self.GEN_TEXT, self.generate, obj="gen")
+        inner = QWidget(); L = QVBoxLayout(inner); L.setContentsMargins(0, 0, 6, 0); L.setSpacing(8)
+        for w in (g_eng, g_voice, g_adv): L.addWidget(w)
+        L.addWidget(g_txt, 1)
+        left = QScrollArea(); left.setWidgetResizable(True); left.setWidget(inner); left.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        col = QWidget(); col.setMinimumWidth(440); col.setLayout(vbox((left, 1), self.btn_gen, s=8)); col.layout().setContentsMargins(10, 8, 4, 8)
+        # --- плеер и лента
+        self.player = AudioPlayer(owner.status); self.player.autoplay.setChecked(c.get("autoplay", True))
+        self.list_w = QWidget(); self.list_l = QVBoxLayout(self.list_w); self.list_l.setContentsMargins(0, 0, 4, 0); self.list_l.setSpacing(8); self.list_l.addStretch(1)
+        self.empty = label("Здесь появятся локальные дубли.\nОни хранятся отдельно от платных и бесплатных.", "emptylbl"); self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter); self.list_l.insertWidget(0, self.empty)
+        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True); self.scroll.setWidget(self.list_w)
+        right = QWidget(); right.setLayout(vbox(self.player, hbox(label("Локальные дубли", "section"), label("новые сверху, хранятся 7 дней", "meta"), 1), (self.scroll, 1), s=8)); right.layout().setContentsMargins(4, 8, 10, 8)
+        self.split = QSplitter(Qt.Orientation.Horizontal); self.split.setChildrenCollapsible(False); self.split.addWidget(col); self.split.addWidget(right)
+        if modern: self.split.setObjectName("modern"); left.setObjectName("clear"); self.scroll.setObjectName("clear")
+        self.setLayout(vbox((self.split, 1)))
+        self.chk_ultimate.toggled.connect(self._ultimate_toggled); self._cleanup()
+        for t in sorted(self.takes, key=lambda t: t.get("created", 0)): self._add_card(t)
+        self.empty.setVisible(not self.takes); self._count(); self.refresh_state()
+
+    # ---------- состояние
+    def busy(self): return self.phase != "idle"
+    def state(self):
+        return dict(model=self.cb_model.currentData(), device=self.cb_device.currentData(), lora=self.ed_lora.text().strip(), optimize=self.chk_opt.isChecked(), ref=self.ref, ref_name=self.ref_name,
+                    ultimate=self.chk_ultimate.isChecked(), prompt=self.ed_prompt.toPlainText().strip(), control=self.ed_control.text().strip(), denoise=self.chk_denoise.isChecked(),
+                    normalize=self.chk_norm_text.isChecked(), cfg=self.sl_cfg.value() / 100, steps=self.sl_steps.value(), seed=self.ed_seed.text().strip(), random_seed=self.chk_rand.isChecked(),
+                    text=self.txt.toPlainText(), batch=self.chk_batch.isChecked(), save_wav=self.chk_wav.isChecked(), autoplay=self.player.autoplay.isChecked())
+    def _want(self): return dict(model=self.cb_model.currentData(), device=self.cb_device.currentData(), lora=self.ed_lora.text().strip(), optimize=self.chk_opt.isChecked())
+    def _count(self): self.lbl_count.setText(f"Символов: <b>{len(self.txt.toPlainText())}</b> &nbsp;·&nbsp; <b>Бесплатно, на этом компьютере</b>")
+    def _toggle_log(self, on):
+        self.log_view.setVisible(on)
+        if on: self.log_view.setPlainText("\n".join(self.log)); self.log_view.verticalScrollBar().setValue(self.log_view.verticalScrollBar().maximum())
+    def _log(self, text):
+        for part in re.split(r"[\r\n]+", text):
+            if part.strip():
+                self.log.append(part.rstrip()[:400])
+                if self.log_view.isVisible(): self.log_view.appendPlainText(part.rstrip()[:400])
+
+    def refresh_state(self):
+        ready = voxcpm_ready(self.root); installing = self.phase == "installing"
+        self.stack.setCurrentIndex(1 if ready and not installing else 0); cur = self.stack.currentWidget()
+        for i in range(self.stack.count()):  # стек занимает только высоту текущей страницы
+            self.stack.widget(i).setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred if self.stack.widget(i) is cur else QSizePolicy.Policy.Ignored)
+        self.stack.adjustSize(); self.ed_root.setText(str(self.root))
+        try:
+            anchor = next(p for p in (self.root, *self.root.parents) if p.exists()); free = shutil.disk_usage(anchor).free / 2 ** 30
+            self.lbl_space.setText(f"Свободно на диске {anchor.anchor}: {free:.0f} ГБ, нужно около {VOXCPM_NEED_GB} ГБ." + ("" if free >= VOXCPM_NEED_GB else " Места не хватит, выберите другой диск."))
+        except (OSError, StopIteration): self.lbl_space.setText("")
+        self._update_mode(); self._update_status()
+
+    def _update_status(self):
+        i, p = self.info, self.phase; el = int(time.time() - self.started) if self.started else 0
+        if p == "starting": t = f"Запускаю VoxCPM… {el} с"
+        elif p == "loading": t = f"Загружаю модель в память… {el} с. Обычно это 1–3 минуты"
+        elif p == "generating": t = f"Генерация… {el} с" + (f" · дубль {self.batch_done + 1} из {self.batch_total}" if self.batch_total > 1 else "")
+        elif p == "asr": t = f"Распознаю текст образца… {el} с"
+        elif p == "removing": t = "Удаляю VoxCPM с диска…"
+        elif self.loaded: t = f"Готово: {str(i.get('model', '')).split('/')[-1]} на " + (f"видеокарте {i.get('gpu', '')}" if str(i.get("device", "")).startswith("cuda") else "процессоре")
+        else: t = "Установлено. Модель загрузится при первой генерации"
+        self.lbl_state.setText(t); v = i.get("vram") if self.loaded else None
+        self.lbl_vram.setText(f"Видеопамять занята: {v[0]:.1f} из {v[1]:.1f} ГБ" if v else ""); self.lbl_vram.setVisible(bool(v))
+        idle = p == "idle"; self.btn_load.setEnabled(idle and self.loaded != self._want()); self.btn_stop.setEnabled(self.proc is not None)
+        self.btn_gen.setEnabled(idle or p == "installing"); self.btn_asr.setEnabled(idle and bool(self.ref))
+        if p in ("starting", "loading", "generating"): self.btn_gen.setText(f"⏳  {t.upper()}")
+        else: self.btn_gen.setText(self.GEN_TEXT)
+
+    def _tick(self): self._update_status()
+    def _set_phase(self, phase):
+        if phase != self.phase: self.started = time.time()  # счётчик секунд идёт с начала текущего этапа
+        self.phase = phase
+        if phase == "idle": self.timer.stop()
+        elif not self.timer.isActive(): self.timer.start()
+        self._update_status()
+
+    def _update_mode(self):
+        ult, ref = self.chk_ultimate.isChecked(), bool(self.ref)
+        self.box_prompt.setVisible(ult); self.ed_control.setEnabled(not ult)
+        self.lbl_ref.setText(self.ref_name or "нет: голос создаётся по описанию"); self.lbl_ref.setToolTip(self.ref)
+        self.lbl_mode.setText("Точное клонирование: модель продолжает образец и повторяет тембр, ритм и манеру. Описание отключено." + ("" if ref else " Добавьте образец голоса.") if ult else
+                              "Управляемое клонирование: тембр берётся из образца, а описание задаёт эмоцию, темп и стиль." if ref else
+                              "Дизайн голоса: голос создаётся по описанию. Без описания модель подберёт голос под текст сама.")
+
+    # ---------- образец голоса
+    def _set_ref(self, path, name):
+        self.ref, self.ref_name = str(path), name; self.ed_prompt.clear(); self._update_mode(); self._update_status(); self.owner.save_cfg()
+        if self.chk_ultimate.isChecked(): self.run_asr()
+    def pick_ref(self):
+        f, _ = QFileDialog.getOpenFileName(QApplication.activeWindow() or self.owner, "Образец голоса", "", "Аудио (*.wav *.mp3 *.flac *.ogg)")
+        if not f: return
+        try:
+            data = Path(f).read_bytes(); dst = LOCAL_DIR / f"ref_{hashlib.sha256(data).hexdigest()[:16]}.wav"
+            if not dst.is_file():  # образец приводится к WAV: его одинаково читают модель, шумоподавление и распознавание
+                d = decode_native(data, miniaudio.SampleFormat.SIGNED16)
+                with wave.open(str(dst), "wb") as w: w.setnchannels(d.nchannels); w.setsampwidth(2); w.setframerate(d.sample_rate); w.writeframes(d.samples.tobytes())
+        except Exception as e: return QMessageBox.warning(QApplication.activeWindow() or self.owner, "Образец голоса", f"Не удалось прочитать файл:\n{type(e).__name__}: {e}")
+        self._set_ref(dst, Path(f).name)
+    def clear_ref(self): self.ref = self.ref_name = ""; self._update_mode(); self._update_status(); self.owner.save_cfg()
+    def play_ref(self):
+        if self.ref: self.player.play_file(self.ref, f"Образец · {self.ref_name}")
+    def _ultimate_toggled(self, on):
+        self._update_mode()
+        if on and self.ref and not self.ed_prompt.toPlainText().strip(): self.run_asr()  # как в оригинале: текст образца распознаётся сам
+    def _toggle_rec(self, on):
+        parent = QApplication.activeWindow() or self.owner
+        if on:
+            dev = QMediaDevices.defaultAudioInput()
+            if dev.isNull(): self.btn_rec.setChecked(False); return QMessageBox.warning(parent, "Запись", "Микрофон не найден.")
+            fmt = dev.preferredFormat(); fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
+            if not dev.isFormatSupported(fmt): fmt = dev.preferredFormat()
+            self.rec_fmt = fmt; self.rec_buf = bytearray(); self.rec_src = QAudioSource(dev, fmt, self); self.rec_io = self.rec_src.start()
+            if self.rec_io is None: self.rec_src = None; self.btn_rec.setChecked(False); return QMessageBox.warning(parent, "Запись", "Не удалось начать запись с микрофона.")
+            self.rec_io.readyRead.connect(lambda: self.rec_buf.extend(bytes(self.rec_io.readAll()))); self.btn_rec.setText("■ Стоп"); self.owner.status("Идёт запись образца. Нажмите «Стоп», когда закончите", 0)
+            return
+        if not self.rec_src: return
+        self.rec_src.stop(); self.rec_buf.extend(bytes(self.rec_io.readAll())) if self.rec_io else None
+        fmt, raw = self.rec_fmt, bytes(self.rec_buf); self.rec_src = self.rec_io = None; self.btn_rec.setText("● Запись"); self.owner.status("Запись остановлена")
+        try:
+            sf_ = fmt.sampleFormat(); F = QAudioFormat.SampleFormat
+            if sf_ == F.Int16: pcm = raw
+            elif AUDIO_OK and sf_ in (F.Int32, F.Float, F.UInt8):
+                a = np.frombuffer(raw, dtype={F.Int32: "<i4", F.Float: "<f4", F.UInt8: "u1"}[sf_]).astype(np.float64)
+                a = a / 2147483648.0 if sf_ == F.Int32 else (a - 128) / 128.0 if sf_ == F.UInt8 else a
+                pcm = (np.clip(a, -1, 1) * 32767).astype("<i2").tobytes()
+            else: raise ValueError("микрофон отдаёт звук в неподдерживаемом формате")
+            if len(pcm) < fmt.sampleRate() * fmt.channelCount() * 2: return QMessageBox.information(parent, "Запись", "Запись короче секунды. Запишите 5–15 секунд речи.")
+            dst = LOCAL_DIR / f"ref_mic_{time.strftime('%Y%m%d_%H%M%S')}.wav"
+            with wave.open(str(dst), "wb") as w: w.setnchannels(fmt.channelCount()); w.setsampwidth(2); w.setframerate(fmt.sampleRate()); w.writeframes(pcm)
+        except Exception as e: return QMessageBox.warning(parent, "Запись", f"Не удалось сохранить запись:\n{e}")
+        self._set_ref(dst, f"Запись с микрофона {time.strftime('%H:%M:%S')}")
+    def run_asr(self):
+        if not self.ref or self.phase != "idle": return
+        if not voxcpm_ready(self.root): return
+        self.asr_req = self.ref; self._pump()
+    def pick_lora(self):
+        d = QFileDialog.getExistingDirectory(QApplication.activeWindow() or self.owner, "Папка с весами LoRA", self.ed_lora.text() or str(Path.home()))
+        if d: self.ed_lora.setText(str(Path(d)))
+
+    # ---------- установка и удаление
+    def pick_root(self):
+        if self.phase != "idle": return
+        d = QFileDialog.getExistingDirectory(QApplication.activeWindow() or self.owner, "Папка для VoxCPM", str(next((p for p in (self.root, *self.root.parents) if p.exists()), Path.home())))
+        if not d: return
+        d = Path(d); empty = not any(d.iterdir())
+        self.root = d if empty or (d / "installed.json").is_file() or (d / "venv").is_dir() else d / "VoxCPM"  # в непустую чужую папку ставим подпапкой
+        self.owner.cfg["local_rt"] = str(self.root); self.owner.save_cfg(); self.refresh_state()
+        if voxcpm_ready(self.root): self.owner.status("В этой папке уже есть готовая установка VoxCPM")
+    def install(self):
+        parent = QApplication.activeWindow() or self.owner
+        if self.phase != "idle": return
+        try: free = shutil.disk_usage(next(p for p in (self.root, *self.root.parents) if p.exists())).free / 2 ** 30
+        except (OSError, StopIteration): free = 0
+        if free < VOXCPM_NEED_GB and QMessageBox.question(parent, "Мало места", f"На диске свободно {free:.0f} ГБ, а нужно около {VOXCPM_NEED_GB} ГБ. Всё равно начать?") != QMessageBox.StandardButton.Yes: return
+        self.owner.cfg["local_rt"] = str(self.root); self.owner.save_cfg()
+        self.runner = InstallRunner(self.root, self); self.runner.line.connect(self.install_log.appendPlainText); self.runner.step.connect(self._install_step); self.runner.done.connect(self._install_done)
+        self.install_log.clear(); self.install_log.show(); self.btn_install.setEnabled(False); self.btn_cancel.show(); self.phase = "installing"; self._update_status(); self.runner.start()
+    def _install_step(self, i, n, title):
+        self.lbl_step.setText(f"Шаг {i} из {n}: {title}…" if n else f"{title}…"); self.install_log.appendPlainText(f"--- {title}"); self.owner.status(f"Установка VoxCPM: {title}", 0)
+    def _install_done(self, ok, msg):
+        self.runner = None; self.phase = "idle"; self.btn_install.setEnabled(True); self.btn_cancel.hide(); self.lbl_step.setText("" if ok else "Установка не завершена. Её можно запустить снова: скачанное сохранится.")
+        self.refresh_state(); self.owner.status("VoxCPM установлен" if ok else "Установка VoxCPM не удалась", 15000)
+        if not ok: QMessageBox.critical(QApplication.activeWindow() or self.owner, "Установка VoxCPM", msg)
+    def cancel_install(self):
+        if self.runner: self.runner.cancel(); self.runner = None
+        self.phase = "idle"; self.btn_install.setEnabled(True); self.btn_cancel.hide(); self.lbl_step.setText("Установка отменена. Её можно запустить снова: скачанное сохранится."); self._update_status()
+    def uninstall(self):
+        parent = QApplication.activeWindow() or self.owner
+        if self.phase not in ("idle",) : return QMessageBox.information(parent, "VoxCPM", "Дождитесь окончания текущей операции.")
+        if QMessageBox.question(parent, "Удалить VoxCPM", f"Удалить модель и окружение из папки\n{self.root}?\n\nОсвободится около {VOXCPM_NEED_GB} ГБ. Дубли и образцы голоса останутся.") != QMessageBox.StandardButton.Yes: return
+        self._kill_proc(); self._set_phase("removing"); self.remover = RemoveWorker(self.root)
+        def end(msg=""):
+            self._set_phase("idle"); self.refresh_state()
+            if msg: QMessageBox.warning(QApplication.activeWindow() or self.owner, "Удаление VoxCPM", msg)
+            else: self.owner.status("VoxCPM удалён с диска")
+        self.owner._start(self.remover, end, end)
+
+    # ---------- процесс модели
+    def _send(self, **cmd): self.proc.write((json.dumps(cmd, ensure_ascii=False) + "\n").encode("utf-8"))
+    def _ensure_proc(self):
+        if self.proc is not None: return self.hello
+        try: (self.root / WORKER_NAME).write_text(VOXCPM_WORKER, encoding="utf-8"); (self.root / "tmp").mkdir(parents=True, exist_ok=True)
+        except OSError as e: self._fail(f"Не удалось подготовить запуск VoxCPM:\n{e}"); return False
+        self.hello = False; self.stopping = False; self.out_buf = b""; self.proc = p = QProcess(self); p.setProcessEnvironment(qenv(voxcpm_env(self.root))); p.setWorkingDirectory(str(self.root))
+        p.readyReadStandardOutput.connect(self._read_out); p.readyReadStandardError.connect(lambda: self._log(bytes(p.readAllStandardError()).decode("utf-8", "replace")))
+        p.finished.connect(lambda *_a, p=p: self._proc_finished(p)); p.errorOccurred.connect(lambda err, p=p: self._proc_finished(p) if err == QProcess.ProcessError.FailedToStart else None)
+        self._set_phase("starting"); start_proc(p, voxcpm_python(self.root), ["-u", str(self.root / WORKER_NAME), str(os.getpid())]); return False
+    def _read_out(self):
+        self.out_buf += bytes(self.proc.readAllStandardOutput()); *lines, self.out_buf = self.out_buf.split(b"\n")
+        for raw in lines:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith(WORKER_PREFIX): self._log(line); continue
+            try: ev = json.loads(line[len(WORKER_PREFIX):])
+            except ValueError: continue
+            self._event(ev)
+    def _proc_finished(self, p):
+        if p is not self.proc: return
+        crashed = not self.stopping and (self.phase != "idle" or self.jobs); self.proc = None; self.hello = False; self.loaded = None; self.info = {}; p.deleteLater()
+        if crashed: self._fail("Процесс VoxCPM неожиданно завершился.\n\nПоследние сообщения:\n" + "\n".join(list(self.log)[-8:]))
+        elif self.phase != "installing": self._set_phase("idle")
+    def _kill_proc(self):
+        p = self.proc
+        if p is None: return
+        self.stopping = True; self.jobs.clear(); self.cur = None; self.want_load = False; self.asr_req = None
+        busy = self.phase in ("loading", "generating", "asr")  # команды читаются только между задачами: занятый процесс завершается принудительно
+        try: p.write(b'{"cmd": "abort"}\n'); p.waitForBytesWritten(500)
+        except Exception: pass
+        if busy or not p.waitForFinished(2500): kill_tree(p)
+        if self.proc is p: self._proc_finished(p)
+    def stop(self):
+        self._kill_proc(); self._set_phase("idle"); self.owner.status("VoxCPM остановлен, память освобождена")
+    def shutdown(self):
+        """При закрытии программы: остановить запись, установку и процесс модели."""
+        if self.rec_src: self.rec_src.stop(); self.rec_src = None
+        if self.runner: self.runner.cancel(); self.runner = None
+        self._kill_proc()
+    def load_model(self):
+        lora = self.ed_lora.text().strip()
+        if lora and not Path(lora).exists(): return QMessageBox.warning(QApplication.activeWindow() or self.owner, "LoRA", f"Папка или файл с весами LoRA не найдены:\n{lora}")
+        if self.phase == "idle" and voxcpm_ready(self.root): self.want_load = True; self._pump()
+
+    def _pump(self):
+        """Следующий шаг очереди: запуск процесса → распознавание → загрузка модели → генерация."""
+        if self.phase != "idle" and not (self.phase == "starting" and self.hello): return
+        if not (self.jobs or self.want_load or self.asr_req): return self._set_phase("idle")
+        if not self._ensure_proc(): return
+        if self.asr_req:
+            wav, self.asr_req = self.asr_req, None; self._set_phase("asr"); return self._send(cmd="asr", id="asr", wav=wav)
+        if self.loaded != self._want():
+            self.loading_key = self._want(); self._set_phase("loading"); return self._send(cmd="load", **self.loading_key)
+        self.want_load = False
+        if self.jobs:
+            self.cur = self.jobs.pop(0); self._set_phase("generating")
+            return self._send(cmd="generate", **{k: self.cur[k] for k in ("id", "text", "control", "ref", "prompt_text", "cfg", "steps", "normalize", "denoise", "seed", "out")})
+        self._set_phase("idle")
+
+    def _event(self, ev):
+        kind = ev.get("ev")
+        if kind == "hello": self.hello = True; self.phase = "idle" if not (self.jobs or self.want_load or self.asr_req) else "starting"; self._pump()
+        elif kind == "status": self._log(ev.get("msg", "")); self.owner.status(ev.get("msg", ""), 0)
+        elif kind == "loaded":
+            self.loaded, self.info = self.loading_key, ev; self.phase = "idle"; self.owner.status(f"Модель загружена за {ev.get('secs', 0)} с", 8000); self._pump()
+        elif kind == "asr":
+            self.ed_prompt.setPlainText(ev.get("text", "")); self.phase = "idle"; self.owner.status("Текст образца распознан. Проверьте его и поправьте, если нужно", 12000); self._pump()
+        elif kind == "done": self._ready(ev)
+        elif kind == "error": self._worker_error(ev)
+
+    def _worker_error(self, ev):
+        where, msg = ev.get("where"), ev.get("msg", ""); self._log(ev.get("trace", ""))
+        if where == "load": self.loaded = None
+        if ev.get("oom"):
+            self.loaded = None; self.info = {}
+            msg = ("Не хватило памяти видеокарты.\n\nЗакройте игры и другие программы, которые используют видеокарту, и попробуйте снова. "
+                   "Можно выбрать устройство «Процессор»: это медленно, но память видеокарты не нужна.\n\n") + msg[:300]
+        self._fail(msg if where != "asr" else f"Не удалось распознать текст образца:\n{msg}\n\nВведите текст вручную.")
+
+    def _fail(self, msg):
+        self.jobs.clear(); self.cur = None; self.want_load = False; self.asr_req = None; self._set_phase("idle"); self.owner.status("Ошибка локальной генерации")
+        QMessageBox.critical(QApplication.activeWindow() or self.owner, "Локальная генерация", msg)
+
+    # ---------- генерация
+    def generate(self):
+        parent = QApplication.activeWindow() or self.owner
+        if self.phase == "installing": return QMessageBox.information(parent, "VoxCPM", "Дождитесь окончания установки.")
+        if self.phase != "idle": return
+        if not voxcpm_ready(self.root): return QMessageBox.information(parent, "VoxCPM", "Сначала установите VoxCPM: кнопка «Установить VoxCPM» вверху вкладки.")
+        st = self.state(); text = st["text"].strip(); ult = st["ultimate"]
+        if not text: self.txt.setFocus(); return QMessageBox.warning(parent, "Нет текста", "Введите текст для озвучки.")
+        if ult and not self.ref: return QMessageBox.warning(parent, "Точное клонирование", "Добавьте образец голоса: файл или запись с микрофона.")
+        if ult and not st["prompt"]: return QMessageBox.warning(parent, "Точное клонирование", "Введите текст образца или нажмите «Распознать».")
+        if st["lora"] and not Path(st["lora"]).exists(): return QMessageBox.warning(parent, "LoRA", f"Папка или файл с весами LoRA не найдены:\n{st['lora']}")
+        if not self.chk_rand.isChecked() and not st["seed"]: self.chk_rand.setChecked(True)
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()] if st["batch"] else [text]
+        for ln in lines:
+            seed = random.randint(0, 2 ** 32 - 1) if self.chk_rand.isChecked() else int(st["seed"])
+            out = LOCAL_DIR / f"local_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.wav"
+            self.jobs.append(dict(id=uuid.uuid4().hex, text=ln, control="" if ult else st["control"], ref=self.ref, ref_name=self.ref_name, prompt_text=st["prompt"] if ult else "",
+                                  cfg=st["cfg"], steps=st["steps"], normalize=st["normalize"], denoise=st["denoise"] and bool(self.ref), seed=seed, out=str(out), model=st["model"]))
+        self.batch_total, self.batch_done = len(lines), 0; self.owner.save_cfg(); self._pump()
+
+    def _ready(self, ev):
+        j = self.cur; self.cur = None; self.phase = "idle"
+        if not j or not Path(j["out"]).is_file(): return self._fail("Модель не вернула аудио.")
+        if isinstance(ev.get("vram"), list): self.info["vram"] = ev["vram"]
+        seed = ev.get("seed") if ev.get("seed") is not None else j["seed"]; self.ed_seed.setText(str(seed)); self.batch_done += 1
+        mode = "точный клон" if j["prompt_text"] else "клон" if j["ref"] else "дизайн голоса"
+        parts = [j["control"] or ("образец: " + j["ref_name"] if j["ref"] else "голос подобран моделью"), f"CFG {j['cfg']:.1f}", f"шаги {j['steps']}", f"seed {seed}",
+                 f"{ev.get('audio_s', 0):.1f} с звука за {ev.get('secs', 0):.0f} с"]
+        if j["ref"] and j["control"]: parts.insert(1, "образец: " + j["ref_name"])
+        meta = {"id": j["id"], "created": time.time(), "file": Path(j["out"]).name, "text": j["text"], "model": j["model"].split("/")[-1], "voice": mode, "kind": "local", "meta": " · ".join(parts),
+                "params": {**{k: j[k] for k in ("control", "ref", "ref_name", "prompt_text", "cfg", "steps", "normalize", "denoise", "model")}, "seed": seed}, "saved": False, "exported_name": "", "exported_path": ""}
+        self.takes.append(meta); self.save_index(); card = self._add_card(meta); self.empty.hide()
+        if UI_MODE == "modern": reveal(card)
+        self.owner.status(f"Готово: {ev.get('audio_s', 0):.1f} с звука за {ev.get('secs', 0):.0f} с, на этом компьютере", 15000); self.scroll.verticalScrollBar().setValue(0)
+        if self.player.autoplay.isChecked() and not self.jobs: self._play(meta)
+        self._pump()
+
+    # ---------- дубли
+    def _add_card(self, take):
+        c = TakeCard(take); c.play.connect(self._play); c.load.connect(self._load); c.save.connect(self.owner.save_take); c.delete.connect(self._delete); self.list_l.insertWidget(0, c); self.cards[take["id"]] = c; return c
+    def _play(self, t): self.player.play_file(LOCAL_DIR / t["file"], f"{t['model']} · {t['text'][:70]}")
+    def _load(self, t):
+        p = t.get("params", {}); self.txt.setPlainText(t.get("text", "")); self.ed_control.setText(str(p.get("control", ""))); self.cb_model.setCurrentIndex(max(0, self.cb_model.findData(p.get("model"))))
+        if p.get("ref") and Path(p["ref"]).is_file(): self.ref, self.ref_name = p["ref"], p.get("ref_name", "")
+        elif not p.get("ref"): self.ref = self.ref_name = ""
+        self.chk_ultimate.blockSignals(True); self.chk_ultimate.setChecked(bool(p.get("prompt_text"))); self.chk_ultimate.blockSignals(False); self.ed_prompt.setPlainText(str(p.get("prompt_text", "")))
+        self.sl_cfg.setValue(round(float(p.get("cfg", 2.0)) * 100)); self.sl_steps.setValue(int(p.get("steps", 10))); self.chk_norm_text.setChecked(bool(p.get("normalize"))); self.chk_denoise.setChecked(bool(p.get("denoise")))
+        self.chk_rand.setChecked(False); self.ed_seed.setText(str(p.get("seed", ""))); self._update_mode(); self.txt.setFocus(); self.owner.status("Текст и настройки дубля загружены. Seed зафиксирован: результат повторится")
+    def _delete(self, card):
+        t = card.take; extra = "\n\nСохранённая копия не удаляется." if t.get("saved") else ""
+        if QMessageBox.question(QApplication.activeWindow() or self.owner, "Удалить дубль", f"Удалить дубль?{extra}") != QMessageBox.StandardButton.Yes: return
+        self.player.release()
+        try: (LOCAL_DIR / t["file"]).unlink(missing_ok=True)
+        except OSError as e: return QMessageBox.critical(self.owner, "Ошибка", f"Не удалось удалить файл:\n{e}")
+        if t in self.takes: self.takes.remove(t)
+        self.cards.pop(t["id"], None); card.deleteLater(); self.save_index(); self.empty.setVisible(not self.takes)
+    def _cleanup(self):
+        now, keep = time.time(), []
+        for t in self.takes:
+            f = LOCAL_DIR / t["file"]
+            if not f.is_file(): continue
+            if now - float(t.get("created", 0)) > MAX_AGE:
+                try: f.unlink(); continue
+                except OSError: pass
+            keep.append(t)
+        used = {self.ref} | {str(t.get("params", {}).get("ref", "")) for t in keep}
+        for f in LOCAL_DIR.glob("ref_*.wav"):  # образцы, на которые больше ничто не ссылается
+            try:
+                if str(f) not in used and now - f.stat().st_mtime > MAX_AGE: f.unlink()
+            except OSError: pass
+        self.takes = keep; self.save_index()
+    def save_index(self):
+        try: save_json(LOCAL_DIR / "local_index.json", self.takes)
+        except OSError as e: self.owner.status(f"Не удалось сохранить список локальных дублей: {e}")
+
 # ---------------------------------------------------------------- настройки
 class SettingsDialog(QDialog):
     PAGES = ("Оформление", "Папки", "Ключ", "Громкость", "О программе")
@@ -1376,6 +2097,8 @@ class SettingsDialog(QDialog):
                                   lambda: PREVIEW_DIR, lambda: o.pick_dir("preview"), lambda: o.move_dir("preview", home_dir() / "voice_previews"), lambda: o.open_dir(PREVIEW_DIR)))
         rows.append(self._dir_row("Бесплатная озвучка", "Дубли со вкладки «Бесплатно». Хранятся отдельно от платных, старше 7 дней удаляются автоматически.",
                                   lambda: FREE_DIR, lambda: o.pick_dir("free"), lambda: o.move_dir("free", home_dir() / "free_takes"), lambda: o.open_dir(FREE_DIR)))
+        rows.append(self._dir_row("Локальная озвучка", "Дубли со вкладки «Локальная» и образцы голоса. Сама модель VoxCPM (около 14 ГБ) лежит отдельно, её папка выбирается на вкладке.",
+                                  lambda: LOCAL_DIR, lambda: o.pick_dir("local"), lambda: o.move_dir("local", home_dir() / "local_takes"), lambda: o.open_dir(LOCAL_DIR)))
         rows.append(self._dir_row("Настройки программы", "Файл config.json с настройками и API-ключом. Его расположение не меняется.",
                                   lambda: CONFIG_PATH.parent, lambda: None, lambda: None, lambda: o.open_dir(CONFIG_PATH.parent)))
         last = rows[-1]
@@ -1487,19 +2210,26 @@ class MainWindow(QMainWindow):
         self.cb_theme.setCurrentText(CURRENT_THEME); self.cb_theme.currentTextChanged.connect(self.set_theme)
 
     def _make_pages(self, paid):
-        """Переключатель «Платно / Бесплатно»: две независимые страницы."""
+        """Переключатель «Платная / Бесплатная / Локальная»: три независимые страницы."""
         self.pages = QStackedWidget(); self.pages.setObjectName("pages"); self.pages.addWidget(paid); self.free = FreeTab(self); self.pages.addWidget(self.free)
-        self.btn_paid = QPushButton("Платная генерация"); self.btn_free = QPushButton("Бесплатная генерация"); grp = QButtonGroup(self)
-        for i, b in enumerate((self.btn_paid, self.btn_free)):
+        self.local = LocalTab(self); self.pages.addWidget(self.local)
+        self.btn_paid = QPushButton("Платная"); self.btn_free = QPushButton("Бесплатная"); self.btn_local = QPushButton("Локальная · VoxCPM"); grp = QButtonGroup(self)
+        self.btn_paid.setToolTip("Генерация через OpenRouter или свой ключ ElevenLabs"); self.btn_free.setToolTip("Бесплатные публичные сервисы")
+        self.btn_local.setToolTip("Модель VoxCPM на этом компьютере: дизайн и клонирование голоса")
+        self.tab_btns = (self.btn_paid, self.btn_free, self.btn_local)
+        for i, b in enumerate(self.tab_btns):
             b.setObjectName("tabbtn"); b.setCheckable(True); b.setCursor(Qt.CursorShape.PointingHandCursor); grp.addButton(b); b.clicked.connect(lambda _=False, i=i: self.set_page(i))
-        start = 1 if self.cfg.get("free_tab") else 0; (self.btn_free if start else self.btn_paid).setChecked(True); self.pages.setCurrentIndex(start)
-        return hbox(self.btn_paid, self.btn_free, s=4)
+        start = self.cfg.get("page") if self.cfg.get("page") in (0, 1, 2) else 1 if self.cfg.get("free_tab") else 0
+        self.tab_btns[start].setChecked(True); self.pages.setCurrentIndex(start)
+        return hbox(*self.tab_btns, s=4)
 
     def set_page(self, i):
         if i == self.pages.currentIndex(): return
-        (self.free.player if i == 0 else self.player).stop(); self.pages.setCurrentIndex(i); fade_in(self.pages.currentWidget(), 180); self.save_cfg()
+        for k, pl in enumerate((self.player, self.free.player, self.local.player)):
+            if k != i: pl.stop()
+        self.pages.setCurrentIndex(i); fade_in(self.pages.currentWidget(), 180); self.save_cfg()
 
-    def busy(self): return self.gen_timer.isActive() or self.free.busy
+    def busy(self): return self.gen_timer.isActive() or self.free.busy or self.local.busy()
 
     def _make_update_btn(self):
         self.btn_update = mkbtn(UPDATE_TEXT, self.update_app, f"Установлена версия {APP_VERSION}. Скачивает новую версию и сразу перезапускает программу — настройки и дубли сохраняются")
@@ -1753,6 +2483,8 @@ class MainWindow(QMainWindow):
             else: QTimer.singleShot(0, self._default_split)  # окно уже получило размер: левая колонка 40%, лента 60%
             if c.get("free_splitter") and c.get("geometry_scale") == UI_SCALE: self.free.split.restoreState(QByteArray.fromHex(c["free_splitter"].encode()))
             else: QTimer.singleShot(0, lambda: self._split_40(self.free.split))
+            if c.get("local_splitter") and c.get("geometry_scale") == UI_SCALE: self.local.split.restoreState(QByteArray.fromHex(c["local_splitter"].encode()))
+            else: QTimer.singleShot(0, lambda: self._split_40(self.local.split))
         except Exception: pass
 
     def _split_40(self, sp): w = max(sp.width(), self.width() - 10); sp.setSizes([int(w * .4), w - int(w * .4)])
@@ -1767,6 +2499,7 @@ class MainWindow(QMainWindow):
                         extended=self.chk_ext.isChecked(), autoplay=self.player.autoplay.isChecked(), custom_tags=self.custom_tags,
                         geometry=bytes(self.saveGeometry().toHex()).decode(), splitter=bytes(self.splitter.saveState().toHex()).decode(),
                         ui=UI_MODE, anim_bg=ANIM_BG, anim_ui=ANIM_UI, geometry_scale=UI_SCALE, free=self.free.state(), free_tab=self.pages.currentIndex() == 1,
+                        page=self.pages.currentIndex(), local=self.local.state(), local_splitter=bytes(self.local.split.saveState().toHex()).decode(),
                         free_splitter=bytes(self.free.split.saveState().toHex()).decode(), **({"el_open": self.btn_el.isChecked()} if hasattr(self, "btn_el") else {}),
                         **{k: s.value() / 100 for k, s in (("stability", self.sl_stab), ("similarity", self.sl_sim), ("style", self.sl_style), ("speed", self.sl_speed))})
         try: save_json(CONFIG_PATH, self.cfg)
@@ -2035,6 +2768,7 @@ class MainWindow(QMainWindow):
     # ---------- generation
     def generate(self):
         if self.pages.currentIndex() == 1: return self.free.generate()
+        if self.pages.currentIndex() == 2: return self.local.generate()
         if self.gen_timer.isActive(): return
         model, voice, text = self.model(), self.voice(), self.txt.toPlainText().strip()
         if not text: self.txt.setFocus(); return QMessageBox.warning(self, "Нет текста", "Введите текст для озвучки.")
@@ -2115,20 +2849,21 @@ class MainWindow(QMainWindow):
         else: QDesktopServices.openUrl(QUrl.fromLocalFile(str(d)))
 
     def pick_dir(self, kind):
-        cur = {"cache": CACHE_DIR, "preview": PREVIEW_DIR, "free": FREE_DIR}[kind]
+        cur = {"cache": CACHE_DIR, "preview": PREVIEW_DIR, "free": FREE_DIR, "local": LOCAL_DIR}[kind]
         d = QFileDialog.getExistingDirectory(QApplication.activeWindow() or self, "Новая папка", str(cur))
         if d: self.move_dir(kind, Path(d))
 
     def move_dir(self, kind, new):
         """Меняет папку кэша или превью и переносит туда файлы программы. При ошибке старая папка остаётся рабочей."""
         new = Path(new); old, patterns, cfg_key, dir_arg = {"cache": (CACHE_DIR, CACHE_PATTERNS, "cache_dir", "cache"), "preview": (PREVIEW_DIR, PREVIEW_PATTERNS, "preview_dir", "previews"),
-                                                             "free": (FREE_DIR, FREE_PATTERNS, "free_dir", "free")}[kind]; parent = QApplication.activeWindow() or self
+                                                             "free": (FREE_DIR, FREE_PATTERNS, "free_dir", "free"),
+                                                             "local": (LOCAL_DIR, LOCAL_PATTERNS, "local_dir", "local")}[kind]; parent = QApplication.activeWindow() or self
         if new.resolve() == old.resolve(): return
         if self.busy(): return QMessageBox.information(parent, "Папки", "Дождитесь окончания генерации.")
         try:
             new.mkdir(parents=True, exist_ok=True); probe = new / ".tts_write_test"; probe.write_bytes(b""); probe.unlink()
         except OSError as e: return QMessageBox.critical(parent, "Папки", f"В эту папку нельзя записывать:\n{e}")
-        self.player.release(); self.free.player.release(); QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self.player.release(); self.free.player.release(); self.local.player.release(); QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try: errors = move_files(old, new, patterns)
         except OSError as e: errors = [str(e)]
         finally: QApplication.restoreOverrideCursor()
@@ -2139,6 +2874,7 @@ class MainWindow(QMainWindow):
         try: old.rmdir()  # только если опустела
         except OSError: pass
         set_dirs(**{dir_arg: new}); self.cfg[cfg_key] = str(new)
+        if kind == "local" and self.local.ref and Path(self.local.ref).parent == old: self.local.ref = str(new / Path(self.local.ref).name)  # образец переехал вместе с папкой
         self.save_cfg(); self.update_cache_status(); self.update_ru_dot(); self.settings.refresh_dirs(); self.status(f"Папка изменена: {new}")
 
     def set_scale(self, val, dlg):
@@ -2177,10 +2913,12 @@ class MainWindow(QMainWindow):
         if not Path(folder).is_dir():
             if not self.choose_folder(): return
             folder = self.ed_folder.text().strip()
-        free = bool(card.take.get("free")); src = (FREE_DIR if free else CACHE_DIR) / card.take["file"]
+        kind = card.take.get("kind") or ("free" if card.take.get("free") else "")
+        src = {"free": FREE_DIR, "local": LOCAL_DIR}.get(kind, CACHE_DIR) / card.take["file"]; sub = {"free": "Бесплатная", "local": "Локальная"}.get(kind)
+        ext = ".wav" if kind == "local" and (self.local.chk_wav.isChecked() or not AUDIO_OK) else ".mp3"
         if not src.is_file(): return QMessageBox.critical(self, "Ошибка", "Файл дубля пропал из кэша.")
         name = sanitize_filename(card.ed_name.text()) or auto_name(card.take.get("text", "")); card.ed_name.setText(name)
-        ns = norm_settings(self.cfg); target, dest, group, note, norm = self.cb_norm.currentData(), Path(folder) / "Бесплатная" if free else Path(folder), "", "", None
+        ns = norm_settings(self.cfg); target, dest, group, note, norm = self.cb_norm.currentData(), Path(folder) / sub if sub else Path(folder), "", "", None
         try: dest.mkdir(parents=True, exist_ok=True)
         except OSError as e: return QMessageBox.critical(QApplication.activeWindow() or self, "Ошибка сохранения", f"Не удалось создать папку:\n{e}")
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
@@ -2192,17 +2930,19 @@ class MainWindow(QMainWindow):
                     if g["target"] is not None: target = g["target"]
                     note = f"   ·   исходно {lufs:.1f} LUFS → папка «{group}»"
                 except Exception as e: note = f"   ⚠ не удалось определить группу ({type(e).__name__}: {e}) — файл в основной папке"
-            dst = unique_path(dest, name)
+            dst = unique_path(dest, name, ext)
             if self.chk_norm.isChecked() and AUDIO_OK:
                 try: norm = normalize_mp3(src, dst, target, ns["ceiling"], max_gain=ns["max_gain"])
                 except Exception as e: note += f"   ⚠ нормализация не удалась ({type(e).__name__}: {e}) — сохранён оригинал"
         finally: QApplication.restoreOverrideCursor()
         if norm is None:
-            try: shutil.copy2(src, dst)
-            except OSError as e: return QMessageBox.critical(self, "Ошибка сохранения", f"Не удалось скопировать файл:\n{e}")
+            try:
+                if src.suffix.lower() == dst.suffix.lower(): shutil.copy2(src, dst)
+                else: audio_bytes_to_mp3(src.read_bytes(), dst)  # локальный дубль в WAV сохраняется как MP3
+            except Exception as e: return QMessageBox.critical(self, "Ошибка сохранения", f"Не удалось сохранить файл:\n{e}")
         card.take.update(saved=True, exported_name=dst.name, exported_path=str(dst),
                          export_lufs=round(norm["after"], 1) if norm else None, export_group=group)
-        (self.free.save_index if free else self.save_index)(); card.mark_saved()
+        {"free": self.free.save_index, "local": self.local.save_index}.get(kind, self.save_index)(); card.mark_saved()
         if norm: note += f"   ·   громкость {norm['before']:.1f} → {norm['after']:.1f} LUFS" + ("  (лимитер пиков)" if norm["limited"] else "")
         self.status(f"✓ Сохранено: {dst}" + ("   (имя занято — добавлен суффикс версии)" if dst.stem != name else "") + note, 15000)
 
@@ -2242,7 +2982,7 @@ class MainWindow(QMainWindow):
         if self.empty_lbl: self.empty_lbl.setVisible(not self.takes)
 
     def closeEvent(self, e):
-        self.save_cfg(); self.player.release(); self.free.player.release()
+        self.save_cfg(); self.player.release(); self.free.player.release(); self.local.player.release(); self.local.shutdown()
         for w in list(self.workers):
             if not w.wait(1500): w.terminate(); w.wait(500)
         e.accept()
@@ -2374,6 +3114,7 @@ QRadioButton { background: transparent; spacing: 7px; }
 QPushButton#tabbtn { padding: 6px 16px; font-weight: 700; color: $dim; }
 QPushButton#tabbtn:checked { background: $accent; color: $on_accent; border-color: $accent; }
 QLabel#pagesub { font-size: 9pt; }
+QPlainTextEdit#logview { font-family: 'Cascadia Mono', Consolas, monospace; font-size: 8.5pt; }
 QRadioButton::indicator { width: 14px; height: 14px; border-radius: 8px; border: 2px solid $border_hi; background: $input; }
 QRadioButton::indicator:hover { border-color: $accent; }
 QRadioButton::indicator:checked { border: 2px solid $accent; background: qradialgradient(cx:.5,cy:.5,radius:.5,fx:.5,fy:.5, stop:0 $accent, stop:.55 $accent, stop:.65 $input); }
@@ -2389,6 +3130,20 @@ def combo_arrow_qss(color):
             p.drawPolyline([QPointF(3, 3), QPointF(10, 9), QPointF(17, 3)]); p.end(); img.save(str(f))
         return f"QComboBox::down-arrow {{ image: url({f.as_posix()}); width: 10px; height: 6px; }}"
     except OSError: return ""
+
+def checkbox_qss(t):
+    """Видимая рамка у выключенной галочки и своя галочка у включённой (картинка, как у стрелки списка)."""
+    f = Path(tempfile.gettempdir()) / f"tts_studio_check_{t['on_accent'].lstrip('#')}.png"
+    try:
+        if not f.is_file():
+            img = QImage(28, 28, QImage.Format.Format_ARGB32_Premultiplied); img.fill(Qt.GlobalColor.transparent); p = QPainter(img); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            pen = p.pen(); pen.setColor(QColor(t["on_accent"])); pen.setWidthF(4.2); pen.setCapStyle(Qt.PenCapStyle.RoundCap); pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin); p.setPen(pen)
+            p.drawPolyline([QPointF(6, 14.5), QPointF(12, 20), QPointF(22, 8)]); p.end(); img.save(str(f))
+        mark = f"image: url({f.as_posix()});"
+    except OSError: mark = ""
+    return (f"QCheckBox {{ spacing: 7px; }} QCheckBox::indicator {{ width: 14px; height: 14px; border: 2px solid {t['border_hi']}; border-radius: 4px; background: {t['input']}; }}"
+            f"QCheckBox::indicator:hover {{ border-color: {t['accent']}; }} QCheckBox::indicator:checked {{ background: {t['accent']}; border-color: {t['accent']}; {mark} }}"
+            f"QCheckBox::indicator:disabled {{ border-color: {t['border']}; background: {t['panel']}; }} QCheckBox::indicator:checked:disabled {{ background: {t['faint']}; border-color: {t['faint']}; }}")
 
 def _rgba(hex_color, a):
     c = QColor(hex_color); return f"rgba({c.red()},{c.green()},{c.blue()},{a})"
@@ -2411,7 +3166,7 @@ def apply_theme(app, name=None):
         pal.setColor(QPalette.ColorGroup.Disabled, role, QColor(t["faint"]))
     r = int(t["r"]); app.setPalette(pal)
     v = {k: x for k, x in t.items() if k != "r"}; light = is_light(t["bg"]); a = 225 if light else 205  # полупрозрачные панели поверх анимированного фона
-    qss = QSS.substitute(v, r=r, r2=r + 3, rp=max(r + 4, 12)) + COMMON_QSS.substitute(v, r=r)
+    qss = QSS.substitute(v, r=r, r2=r + 3, rp=max(r + 4, 12)) + COMMON_QSS.substitute(v, r=r) + checkbox_qss(t)
     if UI_MODE == "modern":
         qss += MODERN_QSS.substitute(v, panel_a=_rgba(t["panel"], a), card_a=_rgba(t["card"], a + 15), input_a=_rgba(t["input"], a + 15), raised_a=_rgba(t["raised"], a), border_a=_rgba(t["border_hi"], 130)) + combo_arrow_qss(t["dim"])
     app.setStyleSheet(qss)
